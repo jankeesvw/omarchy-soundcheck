@@ -9,10 +9,11 @@ import "Eq.js" as Eq
 // with a soft brush about a third of an octave wide, so it stays smooth. A
 // right drag paints back towards 0 dB, a double click makes it flat.
 //
-// Three layers: what your microphone is picking up right now (faint, from the
-// meter), what you painted (filled), and what the filters together with the
-// high-pass actually do (the thin line). The last one is computed with the
-// same formulas PipeWire runs, so it is what you hear.
+// Four layers. Behind: what your microphone picks up right now (a faint
+// shadow) and what the chain sends on (a thin line over it), both live from
+// the meter. In front: what you painted (filled), and what the filters
+// together with the high-pass actually do (the thin line). That last one is
+// computed with the same formulas PipeWire runs, so it is what you hear.
 Item {
   id: view
 
@@ -21,6 +22,7 @@ Item {
   property bool highpassOn: true
   property real highpassFreq: 80
   property var spectrum: []
+  property var spectrumOut: []
   property bool bypassed: false
 
   property color foreground: Color.foreground
@@ -138,15 +140,20 @@ Item {
   // The spectrum gets its own scale: -96 to -24 dBFS fills the plot.
   function specY(db) { return padTop + plotH - (Math.max(-96, Math.min(-24, db)) + 96) / 72 * plotH }
 
-  readonly property var spectrumPoints: {
-    var s = view.spectrum
+  // closed: down to the bottom and back, for a filled area; open: just the line.
+  function spectrumPath(s, closed) {
     if (!s || s.length !== Eq.GRID || width <= 0) return []
-    var pts = [Qt.point(0, padTop + plotH), Qt.point(0, specY(s[0]))]
+    var pts = closed ? [Qt.point(0, padTop + plotH)] : []
+    pts.push(Qt.point(0, specY(s[0])))
     for (var k = 0; k < Eq.GRID; k++) pts.push(Qt.point(xOf(Eq.gridFreq(k)), specY(s[k])))
     pts.push(Qt.point(width, specY(s[Eq.GRID - 1])))
-    pts.push(Qt.point(width, padTop + plotH))
+    if (closed) pts.push(Qt.point(width, padTop + plotH))
     return pts
   }
+
+  readonly property var spectrumPoints: spectrumPath(view.spectrum, true)
+  readonly property var outputFill: spectrumPath(view.spectrumOut, true)
+  readonly property var outputLine: spectrumPath(view.spectrumOut, false)
 
   // ---- drawing -----------------------------------------------------------
 
@@ -224,6 +231,22 @@ Item {
       strokeColor: "transparent"
       fillColor: view.alpha(view.foreground, view.spectrumPoints.length ? 0.07 : 0)
       PathPolyline { path: view.spectrumPoints.length ? view.spectrumPoints : [Qt.point(0, 0)] }
+    }
+
+    // What the chain sends on: a lighter wash with an edge, so where it
+    // parts from the shadow above is where the chain changed something.
+    ShapePath {
+      strokeWidth: 0
+      strokeColor: "transparent"
+      fillColor: view.alpha(view.foreground, view.outputFill.length ? 0.05 : 0)
+      PathPolyline { path: view.outputFill.length ? view.outputFill : [Qt.point(0, 0)] }
+    }
+    ShapePath {
+      strokeWidth: 1
+      strokeColor: view.alpha(view.foreground, view.outputLine.length ? 0.38 : 0)
+      fillColor: "transparent"
+      joinStyle: ShapePath.RoundJoin
+      PathPolyline { path: view.outputLine.length ? view.outputLine : [Qt.point(0, 0)] }
     }
 
     // What you painted.
@@ -314,6 +337,37 @@ Item {
     font.pixelSize: Style.font.caption
     font.bold: true
     font.letterSpacing: 1.2
+  }
+
+  Row {
+    id: legend
+    visible: view.spectrumPoints.length > 0
+    anchors.right: parent.right
+    anchors.rightMargin: Style.space(8)
+    y: view.padTop + view.plotH - height - Style.space(5)
+    spacing: Style.space(10)
+
+    Repeater {
+      model: view.outputLine.length ? [{ label: "Microphone", line: false }, { label: "Soundcheck output", line: true }]
+                                    : [{ label: "Microphone", line: false }]
+      delegate: Row {
+        required property var modelData
+        spacing: Style.space(4)
+        Rectangle {
+          anchors.verticalCenter: parent.verticalCenter
+          width: Style.space(12)
+          height: modelData.line ? 1 : Style.space(7)
+          color: view.alpha(view.foreground, modelData.line ? 0.55 : 0.16)
+        }
+        Text {
+          text: modelData.label
+          textFormat: Text.PlainText
+          color: view.fade(view.foreground, 0.5)
+          font.family: view.fontFamily
+          font.pixelSize: Math.round(Style.font.caption * 0.9)
+        }
+      }
+    }
   }
 
   MouseArea {

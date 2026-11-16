@@ -8,7 +8,7 @@ Soundcheck puts a chain in front of your microphone: a curve you paint with the 
 
 And it lets you hear what you did. Record ten seconds and they play straight back the way the others will hear them, with Before and After one click apart. Or listen in: your own voice in your headphones while you paint the curve, through every step.
 
-The bar shows one microphone. Dimmed while Soundcheck is off, the normal colour while it is on, a pair of headphones in your accent colour while you are listening in (the one state you do not want to forget about), and a crossed-out microphone in red when the chain should be running and is not.
+The bar shows a pair of headphones. Dimmed while Soundcheck is off, in your accent colour while it is on, with a dot beside them while you are listening in (the one state you do not want to forget about), and crossed out in red when the chain should be running and is not.
 
 ## Install
 
@@ -47,7 +47,7 @@ Pick the microphone in the panel. The chain listens to that one microphone and n
 
 Drag across the graph and the curve follows the pointer: wherever you go, the curve goes to your height. The brush is soft, about a third of an octave wide, so a quick stroke comes out smooth rather than jagged. Drag with the right button to paint back towards 0 dB, double-click to start over flat.
 
-Behind the curve you see what your microphone is picking up right now, while the panel is open. That is the point of drawing here rather than turning knobs: the hum is a bump at 50 Hz, the boxiness is a hump around 300, the hiss is a shelf above 8 kHz, and you can paint them out where you see them.
+Behind the curve you see what your microphone is picking up right now, as a shadow, and what Soundcheck sends on, as a line over it, while the panel is open. That is the point of drawing here rather than turning knobs: the hum is a bump at 50 Hz, the boxiness is a hump around 300, the hiss is a shelf above 8 kHz, and you can paint them out where you see them.
 
 There are two lines on top. The filled one is what you painted. The thin one is what the filters actually do, worked out with the same formulas PipeWire runs, so it is what you will hear. They match within a dB; where they part is the high-pass at the bottom end.
 
@@ -65,7 +65,7 @@ In the order your voice goes through it:
 |---|---|---|
 | **High-pass** | Rumble, pops, the desk being bumped. Everything below the frequency is cut. | 80 Hz |
 | **Noise removal** | RNNoise, a small neural network that keeps voices and drops fans, keyboards and traffic. The slider is how sure it must be that you are talking. Needs `noise-suppression-for-voice`. | 50% |
-| **Noise gate** | Silence between your sentences. Under the slider sits a meter of your microphone on the same scale, so you can put the knob between the room and your voice. The meter lights up while the gate lets you through. | -55 dB |
+| **Noise gate** | Silence between your sentences. Under the slider runs a strip of the last six seconds: how loud your microphone was, with the threshold drawn across it. What got through is in your accent colour, what the gate held back is grey, so you can put the threshold between the room and your voice and watch it work. | -55 dB |
 | **Curve** | What you painted. | flat |
 | **Compressor** | Evens out loud and quiet. The slider is the threshold, the ratio is 3:1, and half of what it takes away at full level is given back, so switching it on makes you more even rather than quieter. Needs `lsp-plugins-lv2`. | -24 dB |
 | **Limiter** | A ceiling nothing goes past, for the laugh that would otherwise clip. Needs `lsp-plugins-lv2`. | -1 dB |
@@ -87,7 +87,7 @@ Switch on **Listen in** and you hear yourself in your headphones, through every 
 
 It picks the first output that is a pair of headphones. Pick a speaker instead and the panel warns you, because the speakers will feed back into the microphone.
 
-Listening in stays on when you close the panel; the headphones in the bar remind you. It never switches itself on, also not after a restart of the shell, so you will not suddenly hear yourself out of nowhere.
+Listening in stays on when you close the panel; the dot beside the headphones in the bar reminds you. It never switches itself on, also not after a restart of the shell, so you will not suddenly hear yourself out of nowhere.
 
 ## Keys
 
@@ -135,7 +135,7 @@ Nothing goes over the network. The microphone is opened by the chain only while 
 
 **The meter under the gate does not move.** It shows the microphone picked in the panel. Check that it is the one you are talking into.
 
-**You hear an echo of yourself.** Listening in is on. The headphones in the bar say so.
+**You hear an echo of yourself.** Listening in is on. The dot beside the headphones in the bar says so.
 
 ## Removing it
 

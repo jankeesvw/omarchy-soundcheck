@@ -22,14 +22,16 @@ Singleton {
 
   // Written as \u escapes: a literal private-use glyph does not always survive
   // the editor, and an empty string fails silently as an invisible icon.
-  readonly property string iconMic: ""
-  readonly property string iconMicOff: ""
-  readonly property string iconHeadphones: ""
-  readonly property string iconRecord: ""
-  readonly property string iconStop: ""
-  readonly property string iconPlay: ""
-  readonly property string iconCopy: ""
-  readonly property string iconWarn: ""
+  readonly property string iconMic: "\uf130"
+  readonly property string iconMicOff: "\uf131"
+  readonly property string iconHeadphones: "\uf025"
+  // nf-md-headphones_off, U+F07CE: past U+FFFF, so a surrogate pair.
+  readonly property string iconHeadphonesOff: "\uDB81\uDFCE"
+  readonly property string iconRecord: "\uf111"
+  readonly property string iconStop: "\uf04d"
+  readonly property string iconPlay: "\uf04b"
+  readonly property string iconCopy: "\uf0c5"
+  readonly property string iconWarn: "\uf071"
 
   readonly property string sourceName: "soundcheck_mic"
 
@@ -264,6 +266,12 @@ Singleton {
   property real levelPeak: -120
   property real levelOut: -120
   property var spectrum: []
+  // What the chain sends on, measured the same way. Empty while it is off.
+  property var spectrumOut: []
+  // The last six seconds for the gate's strip: the microphone's peak level,
+  // and whether anything came out of the chain at that moment.
+  property var gateHistory: []
+  readonly property int gateHistoryLength: 120
 
   readonly property bool meterWanted: root.viewers > 0 && root.loaded && !root.busy && !root.recording
 
@@ -289,20 +297,31 @@ Singleton {
         root.levelIn = root.db(m.in)
         root.levelPeak = root.db(m.inPeak)
         root.levelOut = root.db(m.out)
-      } else if (m.type === "spectrum" && Array.isArray(m.bands) && m.bands.length === Eq.GRID) {
-        var b = []
-        for (var i = 0; i < Eq.GRID; i++) b.push(root.db(m.bands[i]))
-        root.spectrum = b
+        var h = root.gateHistory.slice(Math.max(0, root.gateHistory.length - root.gateHistoryLength + 1))
+        h.push({ l: root.levelPeak, o: root.present && root.levelOut > -100 })
+        root.gateHistory = h
+      } else if (m.type === "spectrum") {
+        root.spectrum = root.bands(m.bands)
+        root.spectrumOut = root.bands(m.out)
       }
     }
     onRunningChanged: if (!running) {
       root.levelIn = -120; root.levelPeak = -120; root.levelOut = -120
       root.spectrum = []
+      root.spectrumOut = []
+      root.gateHistory = []
       if (!root.meterWanted) { meterStart.interval = 250; return }
       // Quick deaths (no microphone yet) back off instead of spinning.
       meterStart.interval = Date.now() - root.meterStartedAt < 2000 ? Math.min(10000, meterStart.interval * 2) : 250
       meterStart.restart()
     }
+  }
+
+  function bands(list) {
+    if (!Array.isArray(list) || list.length !== Eq.GRID) return []
+    var out = []
+    for (var i = 0; i < Eq.GRID; i++) out.push(root.db(list[i]))
+    return out
   }
 
   function db(v) {

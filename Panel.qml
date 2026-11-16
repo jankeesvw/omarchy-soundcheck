@@ -9,10 +9,11 @@ import "Eq.js" as Eq
 // your microphone, so every app gets the processed sound. Plus a short test
 // you hear straight back, and listening in on yourself.
 //
-// The bar shows one microphone. Dimmed while Soundcheck is off, normal while
-// it is on, a pair of headphones in the accent colour while you are listening
-// in (the one state you must not forget about), and a crossed-out microphone
-// in red when the chain should be running and is not.
+// The bar shows a pair of headphones. Dimmed while Soundcheck is off, in the
+// accent colour while it is on, with a dot beside it while you are listening
+// in (the one state you must not forget about), and crossed out in red when
+// the chain should be running and is not. Colour is never the only signal:
+// listening in and a broken chain each change the shape as well.
 //
 // Everything with state lives in SoundcheckStore: this widget exists once per
 // monitor, and a loopback per monitor would put you in your ears twice.
@@ -35,10 +36,9 @@ Panel {
     return Qt.rgba(c.r + (bg.r - c.r) * amount, c.g + (bg.g - c.g) * amount, c.b + (bg.b - c.b) * amount, 1)
   }
 
-  readonly property string barGlyph: store.broken ? store.iconMicOff : (store.monitoring ? store.iconHeadphones : store.iconMic)
+  readonly property string barGlyph: store.broken ? store.iconHeadphonesOff : store.iconHeadphones
   readonly property color barColor: store.broken ? root.urgent
-                                  : store.monitoring ? root.accent
-                                  : store.on ? root.barFg
+                                  : store.on ? root.accent
                                   : Qt.rgba(root.barFg.r, root.barFg.g, root.barFg.b, 0.5)
 
   readonly property string statusLine: {
@@ -73,10 +73,40 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     slotSize: root.barSlot
-    text: root.barGlyph
-    foreground: root.barColor
     tooltipText: root.tooltip
     onPressed: function(b) { root.toggle() }
+
+    // Drawn here rather than through `text`, so the listening-in dot can sit
+    // against the glyph; the shell scales an iconComponent down to icon size,
+    // which would shrink the dot to a smudge.
+    hasVisualContent: true
+
+    Item {
+      anchors.fill: parent
+
+      Text {
+        id: barGlyphText
+        anchors.centerIn: parent
+        text: root.barGlyph
+        textFormat: Text.PlainText
+        color: root.barColor
+        font.family: root.fontFamily
+        font.pixelSize: Style.bar.iconFont
+        renderType: Text.NativeRendering
+      }
+
+      Rectangle {
+        visible: store.monitoring && !store.broken
+        width: Style.space(6)
+        height: width
+        radius: width / 2
+        color: root.accent
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.horizontalCenterOffset: Style.bar.iconFont / 2 + Style.space(3)
+        anchors.verticalCenter: parent.verticalCenter
+        anchors.verticalCenterOffset: Style.bar.iconFont / 2.4
+      }
+    }
   }
 
   KeyboardPanel {
@@ -128,9 +158,9 @@ Panel {
               id: heroIcon
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
-              text: store.broken ? store.iconMicOff : store.iconMic
+              text: root.barGlyph
               textFormat: Text.PlainText
-              color: store.broken ? root.urgent : root.foreground
+              color: store.broken ? root.urgent : (store.on ? root.accent : root.foreground)
               opacity: store.on ? 1 : 0.5
               font.family: root.fontFamily
               font.pixelSize: Style.font.display
@@ -290,6 +320,7 @@ Panel {
             highpassOn: store.settings.highpass.on
             highpassFreq: store.settings.highpass.freq
             spectrum: store.spectrum
+            spectrumOut: store.spectrumOut
             bypassed: store.bypass
             foreground: root.foreground
             accent: root.accent
@@ -307,96 +338,107 @@ Panel {
             fontFamily: root.fontFamily
           }
 
-          Grid {
+          // Two steps to a row, except the gate: it gets the full width for
+          // its strip of the last few seconds.
+          Column {
             id: chain
             width: parent.width
-            columns: 2
-            columnSpacing: Style.space(14)
-            rowSpacing: Style.space(6)
-            readonly property real cell: (width - columnSpacing) / 2
+            spacing: Style.space(6)
+            readonly property real cell: (width - Style.space(14)) / 2
 
-            StepRow {
-              width: chain.cell
-              bar: root.bar
-              title: "High-pass"
-              checked: store.settings.highpass.on
-              minimum: 20; maximum: 300; step: 5; bigStep: 20
-              value: store.settings.highpass.freq
-              valueText: Math.round(store.settings.highpass.freq) + " Hz"
-              foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
-              onToggled: store.change(function(s) { s.highpass.on = !s.highpass.on })
-              onMoved: function(v) { store.change(function(s) { s.highpass.freq = Math.round(v) }) }
+            Row {
+              spacing: Style.space(14)
+
+              StepRow {
+                width: chain.cell
+                bar: root.bar
+                title: "High-pass"
+                checked: store.settings.highpass.on
+                minimum: 20; maximum: 300; step: 5; bigStep: 20
+                value: store.settings.highpass.freq
+                valueText: Math.round(store.settings.highpass.freq) + " Hz"
+                foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
+                onToggled: store.change(function(s) { s.highpass.on = !s.highpass.on })
+                onMoved: function(v) { store.change(function(s) { s.highpass.freq = Math.round(v) }) }
+              }
+
+              StepRow {
+                width: chain.cell
+                bar: root.bar
+                title: "Noise removal"
+                mode: !store.packages.rnnoise ? "missing" : (store.on && !store.graph.rnnoise ? "restart" : "ready")
+                packageName: "noise-suppression-for-voice"
+                checked: store.settings.denoise.on
+                minimum: 0; maximum: 95; step: 5; bigStep: 15
+                value: store.settings.denoise.amount
+                valueText: Math.round(store.settings.denoise.amount) + "%"
+                foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
+                onToggled: store.change(function(s) { s.denoise.on = !s.denoise.on })
+                onMoved: function(v) { store.change(function(s) { s.denoise.amount = Math.round(v) }) }
+                onCopyRequested: store.copyCommand("omarchy pkg add noise-suppression-for-voice")
+                onRestartRequested: store.reload()
+              }
+
             }
 
             StepRow {
-              width: chain.cell
-              bar: root.bar
-              title: "Noise removal"
-              mode: !store.packages.rnnoise ? "missing" : (store.on && !store.graph.rnnoise ? "restart" : "ready")
-              packageName: "noise-suppression-for-voice"
-              checked: store.settings.denoise.on
-              minimum: 0; maximum: 95; step: 5; bigStep: 15
-              value: store.settings.denoise.amount
-              valueText: Math.round(store.settings.denoise.amount) + "%"
-              foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
-              onToggled: store.change(function(s) { s.denoise.on = !s.denoise.on })
-              onMoved: function(v) { store.change(function(s) { s.denoise.amount = Math.round(v) }) }
-              onCopyRequested: store.copyCommand("omarchy pkg add noise-suppression-for-voice")
-              onRestartRequested: store.reload()
-            }
-
-            StepRow {
-              width: chain.cell
+              width: chain.width
               bar: root.bar
               title: "Noise gate"
               checked: store.settings.gate.on
               minimum: -90; maximum: -10; step: 1; bigStep: 6
               value: store.settings.gate.threshold
               valueText: Math.round(store.settings.gate.threshold) + " dB"
-              showMeter: true
-              meterLevel: store.levelIn
-              meterPeak: store.levelPeak
+              showGate: true
+              gateHistory: store.gateHistory
+              gateActive: store.present
+              gateIdleLabel: store.present ? "GATE OFF" : "SOUNDCHECK OFF"
               foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
               onToggled: store.change(function(s) { s.gate.on = !s.gate.on })
               onMoved: function(v) { store.change(function(s) { s.gate.threshold = Math.round(v) }) }
             }
 
-            StepRow {
-              width: chain.cell
-              bar: root.bar
-              title: "Compressor"
-              mode: !store.packages.lsp ? "missing" : (store.on && !store.graph.lsp ? "restart" : "ready")
-              packageName: "lsp-plugins-lv2"
-              checked: store.settings.compressor.on
-              minimum: -50; maximum: 0; step: 1; bigStep: 6
-              value: store.settings.compressor.threshold
-              valueText: Math.round(store.settings.compressor.threshold) + " dB, " + Number(store.settings.compressor.ratio).toFixed(1).replace(/\.0$/, "") + ":1"
-              foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
-              onToggled: store.change(function(s) { s.compressor.on = !s.compressor.on })
-              onMoved: function(v) { store.change(function(s) { s.compressor.threshold = Math.round(v) }) }
-              onCopyRequested: store.copyCommand("omarchy pkg add lsp-plugins-lv2")
-              onRestartRequested: store.reload()
+            Row {
+              spacing: Style.space(14)
+
+              StepRow {
+                width: chain.cell
+                bar: root.bar
+                title: "Compressor"
+                mode: !store.packages.lsp ? "missing" : (store.on && !store.graph.lsp ? "restart" : "ready")
+                packageName: "lsp-plugins-lv2"
+                checked: store.settings.compressor.on
+                minimum: -50; maximum: 0; step: 1; bigStep: 6
+                value: store.settings.compressor.threshold
+                valueText: Math.round(store.settings.compressor.threshold) + " dB, " + Number(store.settings.compressor.ratio).toFixed(1).replace(/\.0$/, "") + ":1"
+                foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
+                onToggled: store.change(function(s) { s.compressor.on = !s.compressor.on })
+                onMoved: function(v) { store.change(function(s) { s.compressor.threshold = Math.round(v) }) }
+                onCopyRequested: store.copyCommand("omarchy pkg add lsp-plugins-lv2")
+                onRestartRequested: store.reload()
+              }
+
+              StepRow {
+                width: chain.cell
+                bar: root.bar
+                title: "Limiter"
+                mode: !store.packages.lsp ? "missing" : (store.on && !store.graph.lsp ? "restart" : "ready")
+                packageName: "lsp-plugins-lv2"
+                checked: store.settings.limiter.on
+                minimum: -12; maximum: 0; step: 0.5; bigStep: 3
+                value: store.settings.limiter.ceiling
+                valueText: Number(store.settings.limiter.ceiling).toFixed(1) + " dB"
+                foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
+                onToggled: store.change(function(s) { s.limiter.on = !s.limiter.on })
+                onMoved: function(v) { store.change(function(s) { s.limiter.ceiling = Math.round(v * 2) / 2 }) }
+                onCopyRequested: store.copyCommand("omarchy pkg add lsp-plugins-lv2")
+                onRestartRequested: store.reload()
+              }
+
             }
 
             StepRow {
-              width: chain.cell
-              bar: root.bar
-              title: "Limiter"
-              mode: !store.packages.lsp ? "missing" : (store.on && !store.graph.lsp ? "restart" : "ready")
-              packageName: "lsp-plugins-lv2"
-              checked: store.settings.limiter.on
-              minimum: -12; maximum: 0; step: 0.5; bigStep: 3
-              value: store.settings.limiter.ceiling
-              valueText: Number(store.settings.limiter.ceiling).toFixed(1) + " dB"
-              foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
-              onToggled: store.change(function(s) { s.limiter.on = !s.limiter.on })
-              onMoved: function(v) { store.change(function(s) { s.limiter.ceiling = Math.round(v * 2) / 2 }) }
-              onCopyRequested: store.copyCommand("omarchy pkg add lsp-plugins-lv2")
-              onRestartRequested: store.reload()
-            }
-
-            StepRow {
-              width: chain.cell
+              width: chain.width
               bar: root.bar
               title: "Volume"
               toggleable: false

@@ -1222,9 +1222,13 @@ def level_db(samples):
 
 
 def record_argv(target, fmt, node_name, latency="20ms"):
+    # No node.dont-fallback here, unlike the chain's own capture: on a laptop
+    # microphone (Intel SOF) a second recorder with it set stalls after a few
+    # kilobytes as soon as the chain is being listened to, which left the
+    # meter and the Before half of a test silent.
     return [PW_RECORD, "--target", target, "--rate", str(RATE), "--channels", "1",
             "--format", fmt, "--raw", "--latency", latency,
-            "--properties", "{ node.name = " + node_name + " node.dont-fallback = true media.role = Production }",
+            "--properties", "{ node.name = " + node_name + " media.role = Production }",
             "-"]
 
 
@@ -1245,7 +1249,9 @@ def cmd_meter():
     fds = {p.stdout.fileno(): key for key, p in procs.items()}
     pending = {key: b"" for key in procs}
     recent = {key: array.array("f") for key in procs}
-    ring = array.array("f", [0.0] * FFT_N)
+    # The last FFT_N samples of both sides: the microphone as it comes in, and
+    # what the chain makes of it, so the panel can draw one over the other.
+    rings = {key: array.array("f", [0.0] * FFT_N) for key in procs}
     next_level = next_spec = time.monotonic()
     try:
         while fds:
@@ -1262,9 +1268,9 @@ def cmd_meter():
                 samples = array.array("f")
                 samples.frombytes(buf[:usable])
                 recent[key].extend(samples)
-                if key == "in":
-                    ring.extend(samples)
-                    del ring[:len(ring) - FFT_N]
+                ring = rings[key]
+                ring.extend(samples)
+                del ring[:len(ring) - FFT_N]
             now = time.monotonic()
             if now >= next_level:
                 next_level = now + 0.05
@@ -1278,13 +1284,20 @@ def cmd_meter():
                 emit(msg)
             if now >= next_spec:
                 next_spec = now + 0.1
-                emit({"type": "spectrum", "bands": band_levels(fft_power(ring))})
+                msg = {"type": "spectrum", "bands": band_levels(fft_power(rings["in"]))}
+                if "out" in rings:
+                    msg["out"] = band_levels(fft_power(rings["out"]))
+                emit(msg)
     finally:
         for p in procs.values():
             kill_group(p)
 
 
 def demo_meter():
+    # The output is the input through the demo curve and an 80 Hz high-pass,
+    # and nothing at all while the gate is shut between sentences.
+    curve = demo_settings()["curve"]
+    demo_settings_threshold = demo_settings()["gate"]["threshold"]
     t = 0.0
     while True:
         voice = 0.5 + 0.5 * math.sin(t * 2.3) * math.sin(t * 0.7)
@@ -1297,9 +1310,15 @@ def demo_meter():
             floor = -84 + (10 if 40 < f < 70 else 0)
             v = 10 * math.log10(10 ** ((hump + 30 * (voice - 1)) / 10) + 10 ** (hiss / 10) + 10 ** (floor / 10))
             bands.append(round(clamp(v + 2 * math.sin(t * 5 + k), -120, 0), 1))
-        emit({"type": "level", "in": round(lvl, 1), "inPeak": round(lvl + 9, 1), "out": round(lvl + 3, 1) if voice > 0.35 else -120.0})
+        gate_open = lvl + 9 > demo_settings_threshold
+        out = []
+        for k in range(GRID):
+            f = grid_freq(k)
+            hp = 40 * math.log10(f / 80) if f < 80 else 0.0
+            out.append(round(clamp(bands[k] + curve[k] + hp + 2, -120, 0), 1) if gate_open else -120.0)
+        emit({"type": "level", "in": round(lvl, 1), "inPeak": round(lvl + 9, 1), "out": round(lvl + 3, 1) if gate_open else -120.0})
         if int(t * 20) % 2 == 0:
-            emit({"type": "spectrum", "bands": bands})
+            emit({"type": "spectrum", "bands": bands, "out": out})
         time.sleep(0.05)
         t += 0.05
 

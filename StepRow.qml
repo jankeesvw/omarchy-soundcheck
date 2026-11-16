@@ -27,11 +27,12 @@ Item {
   property string packageName: ""
   property string hint: ""
 
-  // The gate's meter: the level of the microphone on the same scale as the
-  // slider, so the knob sits exactly where the gate opens.
-  property bool showMeter: false
-  property real meterLevel: -120
-  property real meterPeak: -120
+  // The gate's history strip: the last seconds of the microphone with the
+  // threshold across, and what got through in the accent colour.
+  property bool showGate: false
+  property var gateHistory: []
+  property bool gateActive: true
+  property string gateIdleLabel: "GATE OFF"
 
   property color foreground: Color.foreground
   property color accent: Color.accent
@@ -167,34 +168,20 @@ Item {
       onMoved: function(v) { row.forceActiveFocus(); row.moved(v) }
     }
 
-    // The gate's level meter, under the slider and on its scale.
-    Item {
-      visible: row.showMeter && row.mode === "ready"
+    GateView {
+      visible: row.showGate && row.mode === "ready"
       width: parent.width
-      height: Style.space(5)
-
-      readonly property real span: row.maximum - row.minimum
-      function frac(db) { return Math.max(0, Math.min(1, (db - row.minimum) / span)) }
-
-      Rectangle {
-        anchors.fill: parent
-        radius: height / 2
-        color: Qt.rgba(row.foreground.r, row.foreground.g, row.foreground.b, 0.08)
-      }
-      Rectangle {
-        width: parent.width * parent.frac(row.meterLevel)
-        height: parent.height
-        radius: height / 2
-        // Lit while the level is past the threshold: the gate is letting you through.
-        color: row.checked && row.meterLevel >= row.value ? row.accent : row.fade(row.foreground, 0.45)
-      }
-      Rectangle {
-        x: parent.width * parent.frac(row.meterPeak) - width / 2
-        width: Math.max(2, Style.space(2))
-        height: parent.height
-        color: row.fade(row.foreground, 0.2)
-        visible: row.meterPeak > row.minimum
-      }
+      history: row.gateHistory
+      threshold: row.value
+      gateOn: row.checked && row.gateActive
+      idleLabel: row.gateIdleLabel
+      length: SoundcheckStore.gateHistoryLength
+      minimum: row.minimum
+      maximum: row.maximum
+      foreground: row.foreground
+      accent: row.accent
+      background: row.background
+      fontFamily: row.fontFamily
     }
 
     // A step that needs a package: what to install, under the button that copies it.
