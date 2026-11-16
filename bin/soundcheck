@@ -1,0 +1,1481 @@
+#!/usr/bin/python3 -IS
+"""soundcheck: the one place that touches PipeWire, systemd and the files.
+
+The panel runs this and reads JSON. Everything it prints is one JSON object,
+or one per line for the commands that stream.
+
+  soundcheck status                      everything the panel shows, as JSON
+  soundcheck on | off                    put the chain in front of your mic, or take it out
+  soundcheck reload                      rebuild the chain, after installing a package
+  soundcheck live '<settings json>'      apply settings now, without storing them
+  soundcheck save '<settings json>'      store settings and apply them
+  soundcheck mic <node name>             listen to another microphone
+  soundcheck meter                       NDJSON: levels and a spectrum, while the panel is open
+  soundcheck record                      NDJSON: ten seconds of before and after
+  soundcheck play before|after <sink>    play the last test back
+  soundcheck demo on | off               invented devices and curve, for screenshots
+
+Why it is shaped like this:
+
+- The chain runs in its own PipeWire client (`pipewire -c <our config>`) under
+  a systemd user unit, the way Omarchy hosts its own speaker tuning. PipeWire
+  and WirePlumber are never restarted: a restart drops every client, and some
+  hardware (a webcam, in the case this was written for) does not survive it.
+
+- Every step is always in the graph. Switching one off sets neutral values,
+  and every change goes to the running graph through `pw-cli set-param`, so
+  dragging a slider or painting the curve never interrupts a call. The host
+  only restarts when a step that needs a package is added (`reload`).
+
+- The chain captures one fixed microphone, never the default source, because
+  the default source is the chain itself.
+"""
+
+import array
+import cmath
+import errno
+import json
+import math
+import os
+import pwd
+import re
+import secrets
+import select
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import time
+import unicodedata
+import wave
+
+PLUGIN_ID = "jankeesvw.soundcheck"
+UNIT = "omarchy-soundcheck.service"
+NODE_SOURCE = "soundcheck_mic"
+NODE_CAPTURE = "soundcheck_capture"
+NODE_PREFIX = "soundcheck"
+SOURCE_LABEL = "Soundcheck Microphone"
+
+RATE = 48000
+BANDS = 30
+GRID = 59
+BAND_Q = 2.5
+
+RECORD_SECONDS = 10
+RECORD_BYTES = RECORD_SECONDS * RATE * 2   # mono s16
+SETTINGS_BYTES = 32 * 1024
+CONF_BYTES = 64 * 1024
+PACTL_BYTES = 4 * 1024 * 1024
+PWCLI_BYTES = 256 * 1024
+
+LSP_DIR = "/usr/lib/lv2/lsp-plugins.lv2"
+LSP_COMPRESSOR = "http://lsp-plug.in/plugins/lv2/compressor_mono"
+LSP_LIMITER = "http://lsp-plug.in/plugins/lv2/limiter_mono"
+RNNOISE_LIB = "/usr/lib/ladspa/librnnoise_ladspa.so"
+
+PW_CLI = "/usr/bin/pw-cli"
+PW_RECORD = "/usr/bin/pw-record"
+PW_PLAY = "/usr/bin/pw-play"
+PW_METADATA = "/usr/bin/pw-metadata"
+PIPEWIRE = "/usr/bin/pipewire"
+PACTL = "/usr/bin/pactl"
+SYSTEMCTL = "/usr/bin/systemctl"
+
+UID = os.getuid()
+HOME = pwd.getpwuid(UID).pw_dir
+
+# Node names come from PipeWire, which takes them from the USB device. They go
+# into argv and into the SPA-JSON config, so anything outside this shape is
+# refused rather than escaped.
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,190}")
+
+
+# ----------------------------------------------------------------- utilities
+
+def emit(obj):
+    try:
+        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        os._exit(0)
+
+
+def fail(message):
+    emit({"ok": False, "error": message})
+    sys.exit(1)
+
+
+def valid_name(name):
+    return isinstance(name, str) and NAME_RE.fullmatch(name) is not None
+
+
+def plain(text, cap=60):
+    """A label for the panel: no markup characters, no controls, short."""
+    out = []
+    for ch in str(text or ""):
+        if ch in "<>&":
+            continue
+        if unicodedata.category(ch)[0] == "C":
+            ch = " "
+        out.append(ch)
+    s = " ".join("".join(out).split())
+    return s[:cap]
+
+
+def finite(value, fallback):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return v if math.isfinite(v) else fallback
+
+
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+def lin(db):
+    return 10 ** (db / 20)
+
+
+def num(v):
+    """A float as SPA-JSON. Fixed point, so no exponent ever reaches the parser."""
+    return f"{v:.6f}"
+
+
+# ------------------------------------------------------------ child processes
+
+def child_env():
+    env = {"HOME": HOME, "PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8"}
+    for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    return env
+
+
+def run(argv, timeout=5.0, cap=1024 * 1024, data=None):
+    """Run argv in its own session; stdout capped while it is read, not after.
+
+    Returns (exit code, stdout bytes, stderr text). Overflow or a missed
+    deadline kills the whole group and reports a failure, never a truncated
+    answer.
+    """
+    try:
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env(),
+            start_new_session=True, close_fds=True)
+    except OSError as e:
+        return 127, b"", str(e)
+    if data is not None:
+        try:
+            proc.stdin.write(data)
+            proc.stdin.close()
+        except OSError:
+            pass
+    out, err = bytearray(), bytearray()
+    streams = {proc.stdout.fileno(): out, proc.stderr.fileno(): err}
+    deadline = time.monotonic() + timeout
+    overflow = False
+    while streams:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        ready, _, _ = select.select(list(streams), [], [], left)
+        for fd in ready:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                del streams[fd]
+                continue
+            buf = streams[fd]
+            buf += chunk
+            if (buf is out and len(out) > cap) or (buf is err and len(err) > 8192):
+                overflow = True
+                streams.clear()
+                break
+    if streams or overflow:
+        kill_group(proc)
+        return -1, b"", "timed out" if not overflow else "output exceeded its limit"
+    try:
+        rc = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        kill_group(proc)
+        return -1, b"", "timed out"
+    return rc, bytes(out), err.decode("utf-8", "replace")[:2000]
+
+
+def kill_group(proc):
+    for sig, wait in ((signal.SIGTERM, 1.0), (signal.SIGKILL, 1.0)):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            break
+        try:
+            proc.wait(timeout=wait)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def spawn(argv, stdin=False):
+    """A long-running child whose stdout we stream (meter, record, play)."""
+    return subprocess.Popen(
+        argv, stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL if stdin else subprocess.PIPE,
+        stderr=subprocess.DEVNULL, env=child_env(),
+        start_new_session=True, close_fds=True)
+
+
+# --------------------------------------------------------------- the files
+#
+# Every directory is walked from the home directory with held descriptors and
+# every file is opened through one, so a symlink planted anywhere on the way
+# is refused instead of followed.
+
+O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def open_dir(parts, private=False, base=None):
+    fd = os.open(base if base else HOME, O_DIR)
+    try:
+        for i, name in enumerate(parts):
+            last = i == len(parts) - 1
+            try:
+                nfd = os.open(name, O_DIR, dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(name, 0o700 if (private and last) else 0o755, dir_fd=fd)
+                nfd = os.open(name, O_DIR, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+            st = os.fstat(fd)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != UID:
+                raise PermissionError(f"refusing {name}: not a directory of yours")
+        if private:
+            # Repaired every time, not only when the mode looks wrong: the mode
+            # of the directory says nothing about what an older version or
+            # somebody else left inside it.
+            os.fchmod(fd, 0o700)
+            for entry in os.listdir(fd):
+                st = os.stat(entry, dir_fd=fd, follow_symlinks=False)
+                if stat.S_ISREG(st.st_mode):
+                    if st.st_mode & 0o077:
+                        _fchmod_at(fd, entry)
+                elif not stat.S_ISDIR(st.st_mode):
+                    os.unlink(entry, dir_fd=fd)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _fchmod_at(dirfd, name):
+    f = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dirfd)
+    try:
+        if stat.S_ISREG(os.fstat(f).st_mode):
+            os.fchmod(f, 0o600)
+    finally:
+        os.close(f)
+
+
+def runtime_dir():
+    """$XDG_RUNTIME_DIR/omarchy-soundcheck, or nothing: never a /tmp fallback."""
+    base = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not base.startswith("/"):
+        raise PermissionError("XDG_RUNTIME_DIR is not set")
+    fd = os.open(base, O_DIR)
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != UID or st.st_mode & 0o077:
+            raise PermissionError("XDG_RUNTIME_DIR is not private")
+        return _child_private(fd)
+    finally:
+        os.close(fd)
+
+
+def _child_private(parent):
+    try:
+        fd = os.open("omarchy-soundcheck", O_DIR, dir_fd=parent)
+    except FileNotFoundError:
+        os.mkdir("omarchy-soundcheck", 0o700, dir_fd=parent)
+        fd = os.open("omarchy-soundcheck", O_DIR, dir_fd=parent)
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != UID:
+        os.close(fd)
+        raise PermissionError("refusing the runtime directory")
+    os.fchmod(fd, 0o700)
+    for entry in os.listdir(fd):
+        est = os.stat(entry, dir_fd=fd, follow_symlinks=False)
+        if not stat.S_ISREG(est.st_mode) and not stat.S_ISDIR(est.st_mode):
+            os.unlink(entry, dir_fd=fd)
+    return fd
+
+
+def config_dir():
+    return open_dir([".config", "omarchy-soundcheck"], private=True)
+
+
+def unit_dir():
+    return open_dir([".config", "systemd", "user"])
+
+
+def open_regular(dirfd, name, cap):
+    """The descriptor of a regular file of ours, or None if there is none."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dirfd)
+    except FileNotFoundError:
+        return None
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != UID or st.st_nlink != 1 or st.st_size > cap:
+        os.close(fd)
+        raise PermissionError(f"refusing {name}")
+    os.set_blocking(fd, True)
+    return fd
+
+
+def read_file(dirfd, name, cap):
+    fd = open_regular(dirfd, name, cap)
+    if fd is None:
+        return None
+    try:
+        data = b""
+        while len(data) <= cap:
+            chunk = os.read(fd, min(65536, cap + 1 - len(data)))
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > cap:
+            raise PermissionError(f"{name} grew past its limit")
+        return data
+    finally:
+        os.close(fd)
+
+
+def write_file(dirfd, name, data):
+    tmp = f".{name}.{secrets.token_hex(6)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dirfd)
+    try:
+        os.fchmod(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+        os.rename(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        os.fsync(dirfd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dirfd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(fd)
+
+
+def remove_file(dirfd, name):
+    try:
+        st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(st.st_mode):
+        return
+    os.unlink(name, dir_fd=dirfd)
+
+
+def file_exists(path):
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------- settings
+
+def default_settings():
+    return {
+        "version": 1,
+        "mic": "",
+        "monitorSink": "",
+        "curve": [0.0] * GRID,
+        "gains": [0.0] * BANDS,
+        "highpass": {"on": True, "freq": 80.0},
+        "denoise": {"on": True, "amount": 50.0},
+        "gate": {"on": True, "threshold": -55.0},
+        "compressor": {"on": True, "threshold": -24.0, "ratio": 3.0},
+        "limiter": {"on": True, "ceiling": -1.0},
+        "gain": 0.0,
+    }
+
+
+def normalise(raw):
+    """Whatever arrives (the panel, a hand-edited file) leaves in this shape."""
+    s = default_settings()
+    if not isinstance(raw, dict):
+        return s
+
+    def section(key):
+        v = raw.get(key)
+        return v if isinstance(v, dict) else {}
+
+    def onoff(sec, default):
+        v = sec.get("on", default)
+        return v if isinstance(v, bool) else default
+
+    for key in ("mic", "monitorSink"):
+        v = raw.get(key, "")
+        s[key] = v if valid_name(v) else ""
+
+    curve = raw.get("curve")
+    if isinstance(curve, list) and len(curve) == GRID:
+        s["curve"] = [round(clamp(finite(v, 0.0), -12.0, 12.0), 2) for v in curve]
+    gains = raw.get("gains")
+    if isinstance(gains, list) and len(gains) == BANDS:
+        s["gains"] = [round(clamp(finite(v, 0.0), -18.0, 18.0), 2) for v in gains]
+
+    hp = section("highpass")
+    s["highpass"] = {"on": onoff(hp, True), "freq": round(clamp(finite(hp.get("freq"), 80.0), 20.0, 300.0), 1)}
+    dn = section("denoise")
+    s["denoise"] = {"on": onoff(dn, True), "amount": round(clamp(finite(dn.get("amount"), 50.0), 0.0, 95.0), 1)}
+    gt = section("gate")
+    s["gate"] = {"on": onoff(gt, True), "threshold": round(clamp(finite(gt.get("threshold"), -55.0), -90.0, -10.0), 1)}
+    cp = section("compressor")
+    s["compressor"] = {"on": onoff(cp, True),
+                       "threshold": round(clamp(finite(cp.get("threshold"), -24.0), -60.0, 0.0), 1),
+                       "ratio": round(clamp(finite(cp.get("ratio"), 3.0), 1.0, 10.0), 2)}
+    lm = section("limiter")
+    s["limiter"] = {"on": onoff(lm, True), "ceiling": round(clamp(finite(lm.get("ceiling"), -1.0), -12.0, 0.0), 1)}
+    s["gain"] = round(clamp(finite(raw.get("gain"), 0.0), -12.0, 12.0), 1)
+    return s
+
+
+def parse_settings_arg(text):
+    if len(text.encode("utf-8", "replace")) > SETTINGS_BYTES:
+        fail("settings are too large")
+    try:
+        return normalise(json.loads(text))
+    except json.JSONDecodeError:
+        fail("settings are not JSON")
+
+
+def load_json(name, fallback):
+    try:
+        fd = config_dir()
+    except OSError:
+        return fallback
+    try:
+        raw = read_file(fd, name, SETTINGS_BYTES)
+    except (OSError, PermissionError):
+        raw = None
+    finally:
+        os.close(fd)
+    if not raw:
+        return fallback
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return fallback
+
+
+def store_json(name, obj):
+    fd = config_dir()
+    try:
+        write_file(fd, name, (json.dumps(obj, indent=2) + "\n").encode())
+    finally:
+        os.close(fd)
+
+
+def load_settings():
+    return normalise(load_json("settings.json", {}))
+
+
+def load_state():
+    st = load_json("state.json", {})
+    if not isinstance(st, dict):
+        st = {}
+    graph = st.get("graph") if isinstance(st.get("graph"), dict) else {}
+    restore = st.get("restoreSource", "")
+    return {"graph": {"lsp": graph.get("lsp") is True, "rnnoise": graph.get("rnnoise") is True},
+            "restoreSource": restore if valid_name(restore) and not restore.startswith(NODE_PREFIX) else ""}
+
+
+# ------------------------------------------------------------ the demo
+#
+# Invented devices and an invented curve, so screenshots never show the real
+# hardware and look the same in a year. Every write is a no-op while it is on.
+
+DEMO_FILE = "demo"
+
+
+def demo_on():
+    try:
+        fd = config_dir()
+    except OSError:
+        return False
+    try:
+        return open_regular(fd, DEMO_FILE, 64) is not None
+    except PermissionError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def demo_settings():
+    s = default_settings()
+    anchors = [(25, 0), (110, 0.5), (260, -4.0), (600, -1.0), (1500, 0.5), (3800, 4.0), (6000, 2.0), (11000, 3.0), (20000, 1.0)]
+    curve = []
+    for k in range(GRID):
+        x = math.log(grid_freq(k))
+        val = anchors[-1][1]
+        for a in range(len(anchors) - 1):
+            x0, x1 = math.log(anchors[a][0]), math.log(anchors[a + 1][0])
+            if x0 <= x <= x1:
+                f = (x - x0) / (x1 - x0)
+                f = f * f * (3 - 2 * f)
+                val = anchors[a][1] + (anchors[a + 1][1] - anchors[a][1]) * f
+                break
+        if x < math.log(anchors[0][0]):
+            val = anchors[0][1]
+        curve.append(round(val, 2))
+    s["curve"] = curve
+    # The band gains are solved from the curve in the panel (Eq.js); nothing
+    # plays in demo mode, so they are left flat here.
+    s["gains"] = [0.0] * BANDS
+    s["mic"] = "alsa_input.usb-Studio_Mic-00.mono-fallback"
+    s["monitorSink"] = "alsa_output.pci-0000_00_1f.3.analog-stereo"
+    s["gate"]["threshold"] = -48.0
+    return s
+
+
+def demo_status():
+    s = demo_settings()
+    return {
+        "ok": True, "demo": True,
+        "installed": True, "active": True, "present": True, "isDefault": True,
+        "defaultSource": NODE_SOURCE,
+        "mic": s["mic"], "micLabel": "Studio Mic", "micPresent": True,
+        "mics": [{"name": s["mic"], "label": "Studio Mic", "channels": 1},
+                 {"name": "alsa_input.usb-Wireless_Receiver-01.analog-stereo", "label": "Wireless Receiver", "channels": 2}],
+        "sinks": [{"name": s["monitorSink"], "label": "Headphones", "headphones": True},
+                  {"name": "alsa_output.usb-Desk_Speakers-00.analog-stereo", "label": "Desk Speakers", "headphones": False}],
+        "packages": {"lsp": True, "rnnoise": True},
+        "graph": {"lsp": True, "rnnoise": True},
+        "recording": {"before": True, "after": True, "seconds": 6.4},
+        "settings": s,
+    }
+
+
+# ------------------------------------------------------------- PipeWire
+
+def pactl_json(*what):
+    rc, out, _ = run([PACTL, "-f", "json", "list", *what], timeout=4, cap=PACTL_BYTES)
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out.decode("utf-8", "replace"))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, list) else None
+
+
+def default_source():
+    rc, out, _ = run([PACTL, "get-default-source"], timeout=3, cap=1024)
+    name = out.decode("utf-8", "replace").strip() if rc == 0 else ""
+    return name if valid_name(name) else ""
+
+
+def props_of(obj):
+    p = obj.get("properties")
+    return p if isinstance(p, dict) else {}
+
+
+def device_label(obj):
+    """The name Omarchy's own audio panel shows for a device.
+
+    Same rules as its Model.js: the short nickname first, then the
+    description, with the driver's prefixes taken off. Otherwise an XPS
+    microphone reads "sof-soundwire Microphones" here and "Microphone" in the
+    audio panel next to it.
+    """
+    p = props_of(obj)
+    for raw in (p.get("node.nick"), p.get("device.profile.description"), obj.get("description"), obj.get("name")):
+        label = str(raw or "").strip()
+        label = re.sub(r"^sof-soundwire\s+", "", label, flags=re.I)
+        label = re.sub(r"^built-?in audio\s+", "", label, flags=re.I)
+        label = re.sub(r"\s+Output$", "", label, flags=re.I)
+        label = re.sub(r"\s+Input$", "", label, flags=re.I)
+        label = re.sub(r"\bMicrophones\b", "Microphone", label)
+        if label:
+            return plain(label)
+    return "Unknown"
+
+
+def list_mics(sources):
+    """Real microphones: not monitors of an output, and not our own source."""
+    mics = []
+    for src in sources or []:
+        name = src.get("name")
+        if not valid_name(name) or name.startswith(NODE_PREFIX):
+            continue
+        p = props_of(src)
+        if src.get("monitor_source") or p.get("device.class") == "monitor" or name.endswith(".monitor"):
+            continue
+        ch = src.get("channel_map", "")
+        mics.append({"name": name, "label": device_label(src),
+                     "channels": len(str(ch).split(",")) if ch else 0})
+        if len(mics) >= 32:
+            break
+    return mics
+
+
+def is_headphones(sink):
+    p = props_of(sink)
+    if str(p.get("device.form-factor", "")) in ("headphone", "headset", "hands-free"):
+        return True
+    active = sink.get("active_port")
+    for port in sink.get("ports") or []:
+        if isinstance(port, dict) and port.get("name") == active:
+            return str(port.get("type", "")).lower() in ("headphones", "headset")
+    return False
+
+
+def list_sinks(sinks):
+    out = []
+    for sink in sinks or []:
+        name = sink.get("name")
+        if not valid_name(name) or name.startswith(NODE_PREFIX):
+            continue
+        out.append({"name": name, "label": device_label(sink), "headphones": is_headphones(sink)})
+        if len(out) >= 32:
+            break
+    return out
+
+
+def unit_installed():
+    try:
+        fd = unit_dir()
+    except OSError:
+        return False
+    try:
+        return open_regular(fd, UNIT, CONF_BYTES) is not None
+    except PermissionError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def unit_active():
+    rc, _, _ = run([SYSTEMCTL, "--user", "is-active", "--quiet", UNIT], timeout=3, cap=1024)
+    return rc == 0
+
+
+def packages():
+    return {"lsp": file_exists(os.path.join(LSP_DIR, "compressor_mono.ttl")) and file_exists(os.path.join(LSP_DIR, "limiter_mono.ttl")),
+            "rnnoise": file_exists(RNNOISE_LIB)}
+
+
+def pick_mic(settings, mics, current_default):
+    names = [m["name"] for m in mics]
+    if settings["mic"] in names:
+        return settings["mic"]
+    if current_default in names:
+        return current_default
+    return names[0] if names else ""
+
+
+def recording_info():
+    info = {"before": False, "after": False, "seconds": 0.0}
+    try:
+        fd = runtime_dir()
+    except (OSError, PermissionError):
+        return info
+    try:
+        for which in ("before", "after"):
+            f = open_regular(fd, f"{which}.wav", RECORD_BYTES + 4096)
+            if f is not None:
+                st = os.fstat(f)
+                os.close(f)
+                info[which] = st.st_size > 44
+                info["seconds"] = max(info["seconds"], round(max(0, st.st_size - 44) / (RATE * 2), 1))
+    except PermissionError:
+        pass
+    finally:
+        os.close(fd)
+    return info
+
+
+def status():
+    if demo_on():
+        return demo_status()
+    settings = load_settings()
+    state = load_state()
+    sources = pactl_json("sources")
+    sinks = pactl_json("sinks")
+    mics = list_mics(sources)
+    present = any(isinstance(s, dict) and s.get("name") == NODE_SOURCE for s in sources or [])
+    current = default_source()
+    mic = pick_mic(settings, mics, current)
+    label = next((m["label"] for m in mics if m["name"] == mic), "")
+    return {
+        "ok": sources is not None,
+        "demo": False,
+        "installed": unit_installed(),
+        "active": unit_active(),
+        "present": present,
+        "isDefault": current == NODE_SOURCE,
+        "defaultSource": current,
+        "mic": mic,
+        "micLabel": label,
+        "micPresent": any(m["name"] == mic for m in mics),
+        "mics": mics,
+        "sinks": list_sinks(sinks),
+        "packages": packages(),
+        "graph": state["graph"],
+        "recording": recording_info(),
+        "settings": settings,
+    }
+
+
+# ------------------------------------------------------------ the graph
+
+def grid_freq(k):
+    return 1000 * 2 ** ((k - 32) / 6)
+
+
+def band_freq(i):
+    return 1000 * 2 ** ((i - 16) / 3)
+
+
+def band_q(i):
+    # Same widening near the top as Eq.js, so the panel draws what plays.
+    bw = 2 / math.log(2) * math.asinh(1 / (2 * BAND_Q))
+    w0 = 2 * math.pi * band_freq(i) / RATE
+    return 1 / (2 * math.sinh(math.log(2) / 2 * bw * w0 / math.sin(w0)))
+
+
+def controls(s, graph):
+    """Every live control in the graph, as "node:port" -> value.
+
+    The same table renders the config (so a restart comes back where you left
+    it) and goes to pw-cli (so a change is heard at once). A step that is off
+    gets neutral values rather than leaving the graph.
+    """
+    c = {}
+    hp = s["highpass"]
+    c["hp:Freq"] = hp["freq"] if hp["on"] else 5.0
+    if graph.get("rnnoise"):
+        dn = s["denoise"]
+        c["rn:VAD Threshold (%)"] = dn["amount"]
+        c["mix:Gain 1"] = 1.0 if dn["on"] else 0.0
+        c["mix:Gain 2"] = 0.0 if dn["on"] else 1.0
+    gt = s["gate"]
+    # The gate closes 6 dB below where it opens, so a voice trailing off at the
+    # threshold does not flutter the gate open and shut.
+    c["gate:Open Threshold"] = lin(gt["threshold"]) if gt["on"] else 0.0
+    c["gate:Close Threshold"] = lin(gt["threshold"] - 6) if gt["on"] else 0.0
+    for i in range(BANDS):
+        c[f"eq_{i:02d}:Gain"] = s["gains"][i]
+    if graph.get("lsp"):
+        cp = s["compressor"]
+        c["comp:enabled"] = 1.0 if cp["on"] else 0.0
+        c["comp:al"] = lin(cp["threshold"])
+        c["comp:cr"] = cp["ratio"]
+        # Half of the gain the compressor can take away at full scale comes
+        # back as makeup, so turning it on makes you more even, not quieter.
+        c["comp:mk"] = lin(min(18.0, -cp["threshold"] * (1 - 1 / cp["ratio"]) / 2))
+        lm = s["limiter"]
+        c["lim:enabled"] = 1.0 if lm["on"] else 0.0
+        c["lim:th"] = lin(lm["ceiling"])
+    c["out:Mult"] = lin(s["gain"])
+    return c
+
+
+def render(s, graph, mic):
+    if not valid_name(mic):
+        raise ValueError("no microphone to listen to")
+    live = controls(s, graph)
+
+    def ctl(node, fixed=None):
+        parts = []
+        for key, val in (fixed or {}).items():
+            parts.append(f'"{key}" = {num(val)}')
+        prefix = node + ":"
+        for key, val in live.items():
+            if key.startswith(prefix):
+                parts.append(f'"{key[len(prefix):]}" = {num(val)}')
+        return "control = { " + " ".join(parts) + " }"
+
+    nodes = [f'{{ type = builtin name = hp label = bq_highpass {ctl("hp", {"Q": 0.707})} }}']
+    links = []
+    last = "hp:Out"
+    if graph.get("rnnoise"):
+        nodes.append(f'{{ type = ladspa name = rn plugin = "librnnoise_ladspa" label = noise_suppressor_mono '
+                     f'{ctl("rn", {"VAD Grace Period (ms)": 200, "Retroactive VAD Grace (ms)": 0})} }}')
+        nodes.append('{ type = builtin name = dry label = copy }')
+        nodes.append(f'{{ type = builtin name = mix label = mixer {ctl("mix")} }}')
+        links += [f'{{ output = "{last}" input = "rn:Input" }}', f'{{ output = "{last}" input = "dry:In" }}',
+                  '{ output = "rn:Output" input = "mix:In 1" }', '{ output = "dry:Out" input = "mix:In 2" }']
+        last = "mix:Out"
+    nodes.append(f'{{ type = builtin name = gate label = noisegate '
+                 f'{ctl("gate", {"Attack (s)": 0.004, "Hold (s)": 0.25, "Release (s)": 0.15})} }}')
+    links.append(f'{{ output = "{last}" input = "gate:In" }}')
+    last = "gate:Out"
+    for i in range(BANDS):
+        name = f"eq_{i:02d}"
+        nodes.append(f'{{ type = builtin name = {name} label = bq_peaking '
+                     f'{ctl(name, {"Freq": band_freq(i), "Q": band_q(i)})} }}')
+        links.append(f'{{ output = "{last}" input = "{name}:In" }}')
+        last = f"{name}:Out"
+    if graph.get("lsp"):
+        nodes.append(f'{{ type = lv2 name = comp plugin = "{LSP_COMPRESSOR}" '
+                     f'{ctl("comp", {"at": 8, "rt": 120, "kn": 0.5, "scm": 1, "sla": 0, "g_in": 1, "g_out": 1})} }}')
+        nodes.append(f'{{ type = lv2 name = lim plugin = "{LSP_LIMITER}" '
+                     f'{ctl("lim", {"alr": 0, "boost": 0, "lk": 1.0, "at": 1.0, "rt": 10.0, "g_in": 1, "g_out": 1})} }}')
+        links += [f'{{ output = "{last}" input = "comp:in" }}', '{ output = "comp:out" input = "lim:in" }']
+        last = "lim:out"
+    nodes.append(f'{{ type = builtin name = out label = linear {ctl("out", {"Add": 0})} }}')
+    links.append(f'{{ output = "{last}" input = "out:In" }}')
+
+    node_lines = "\n                    ".join(nodes)
+    link_lines = "\n                    ".join(links)
+    return f"""# Written by the Soundcheck plugin ({PLUGIN_ID}); rewritten on every change.
+# Run as its own PipeWire client: pipewire -c <this file>
+# soundcheck-graph: lsp={int(bool(graph.get("lsp")))} rnnoise={int(bool(graph.get("rnnoise")))}
+
+context.properties = {{
+    log.level = 0
+}}
+
+context.spa-libs = {{
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}}
+
+context.modules = [
+    {{ name = libpipewire-module-rt
+        args = {{ rtportal.enabled = false }}
+        flags = [ ifexists nofail ]
+    }}
+    {{ name = libpipewire-module-protocol-native }}
+    {{ name = libpipewire-module-client-node }}
+    {{ name = libpipewire-module-adapter }}
+    {{ name = libpipewire-module-filter-chain
+        args = {{
+            node.description = "{SOURCE_LABEL}"
+            media.name       = "{SOURCE_LABEL}"
+            filter.graph = {{
+                nodes = [
+                    {node_lines}
+                ]
+                links = [
+                    {link_lines}
+                ]
+                inputs  = [ "hp:In" ]
+                outputs = [ "out:Out" ]
+            }}
+            audio.rate     = {RATE}
+            audio.channels = 1
+            audio.position = [ MONO ]
+            capture.props = {{
+                node.name          = "{NODE_CAPTURE}"
+                node.description   = "Soundcheck input"
+                target.object      = "{mic}"
+                # The default source is the chain itself: falling back to it
+                # would feed the chain its own output.
+                node.dont-fallback = true
+                # Only opens the microphone while something listens to it.
+                node.passive       = true
+            }}
+            playback.props = {{
+                node.name        = "{NODE_SOURCE}"
+                node.description = "{SOURCE_LABEL}"
+                media.class      = Audio/Source
+                device.icon-name = "audio-input-microphone"
+            }}
+        }}
+    }}
+]
+"""
+
+
+def unit_text(conf_path):
+    if not re.fullmatch(r"/[A-Za-z0-9/._-]+", conf_path):
+        raise ValueError("the config path has characters a unit file cannot carry")
+    return f"""# Written by the Soundcheck plugin ({PLUGIN_ID}). `soundcheck off` removes it.
+[Unit]
+Description=Soundcheck microphone chain
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+Wants=wireplumber.service
+# The chain loses its connection when PipeWire goes away, so it comes back with it.
+PartOf=pipewire.service
+
+[Service]
+Type=simple
+ExecStart={PIPEWIRE} -c {conf_path}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+"""
+
+
+def conf_path():
+    return os.path.join(HOME, ".config", "omarchy-soundcheck", "pipewire.conf")
+
+
+def write_conf(settings, graph, mic):
+    fd = config_dir()
+    try:
+        write_file(fd, "pipewire.conf", render(settings, graph, mic).encode())
+    finally:
+        os.close(fd)
+
+
+def apply_live(settings, graph):
+    """Send every control to the running chain. Quick: one pw-cli, ~10 ms."""
+    parts = " ".join(f'"{k}" {num(v)}' for k, v in controls(settings, graph).items())
+    rc, _, err = run([PW_CLI, "s", NODE_CAPTURE, "Props", "{ params = [ " + parts + " ] }"], timeout=3, cap=PWCLI_BYTES)
+    return rc == 0
+
+
+def source_index(sources, name):
+    for s in sources or []:
+        if isinstance(s, dict) and s.get("name") == name:
+            return s.get("index")
+    return None
+
+
+def app_streams_on(index):
+    """Recording streams of apps on one source, leaving our own alone."""
+    if index is None:
+        return []
+    out = []
+    for so in pactl_json("source-outputs") or []:
+        if not isinstance(so, dict) or so.get("source") != index:
+            continue
+        p = props_of(so)
+        if str(p.get("node.name", "")).startswith(NODE_PREFIX):
+            continue
+        idx = so.get("index")
+        if isinstance(idx, int) and idx >= 0:
+            out.append(idx)
+    return out[:64]
+
+
+def move_streams(indexes, target):
+    for idx in indexes:
+        run([PACTL, "move-source-output", str(int(idx)), target], timeout=3, cap=4096)
+
+
+def wait_for_node(present=True, seconds=8.0):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        sources = pactl_json("sources")
+        here = source_index(sources, NODE_SOURCE) is not None
+        if here == present:
+            return sources
+        time.sleep(0.25)
+    return None
+
+
+def capture_node_id():
+    for so in pactl_json("source-outputs") or []:
+        p = props_of(so) if isinstance(so, dict) else {}
+        if p.get("node.name") == NODE_CAPTURE:
+            try:
+                return int(p.get("object.id"))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+# ------------------------------------------------------------ commands
+
+def cmd_on():
+    if demo_on():
+        emit({"ok": True, "demo": True})
+        return
+    settings = load_settings()
+    state = load_state()
+    sources = pactl_json("sources")
+    if sources is None:
+        fail("PipeWire is not answering")
+    current = default_source()
+    mic = pick_mic(settings, list_mics(sources), current)
+    if not mic:
+        fail("no microphone found")
+    graph = packages()
+
+    write_conf(settings, graph, mic)
+    ufd = unit_dir()
+    try:
+        write_file(ufd, UNIT, unit_text(conf_path()).encode())
+    finally:
+        os.close(ufd)
+    run([SYSTEMCTL, "--user", "daemon-reload"], timeout=10)
+    run([SYSTEMCTL, "--user", "enable", UNIT], timeout=10)
+    run([SYSTEMCTL, "--user", "restart", UNIT], timeout=10)
+
+    sources = wait_for_node(True)
+    if sources is None:
+        # Never leave a half-installed chain behind: take it all out again,
+        # and the microphone you had stays exactly where it was.
+        teardown()
+        fail("the chain did not start; nothing was changed")
+
+    if current and not current.startswith(NODE_PREFIX):
+        state["restoreSource"] = current
+    state["graph"] = graph
+    settings["mic"] = mic
+    store_json("state.json", state)
+    store_json("settings.json", settings)
+
+    run([PACTL, "set-default-source", NODE_SOURCE], timeout=3)
+    # The default only catches streams that start from now on. A call that is
+    # already running would keep the raw microphone until it was restarted.
+    move_streams(app_streams_on(source_index(sources, current or mic)), NODE_SOURCE)
+    emit({"ok": True})
+
+
+def teardown():
+    run([SYSTEMCTL, "--user", "disable", "--now", UNIT], timeout=10)
+    try:
+        ufd = unit_dir()
+        try:
+            remove_file(ufd, UNIT)
+        finally:
+            os.close(ufd)
+    except OSError:
+        pass
+    try:
+        cfd = config_dir()
+        try:
+            remove_file(cfd, "pipewire.conf")
+        finally:
+            os.close(cfd)
+    except OSError:
+        pass
+    run([SYSTEMCTL, "--user", "daemon-reload"], timeout=10)
+
+
+def cmd_off():
+    if demo_on():
+        emit({"ok": True, "demo": True})
+        return
+    settings = load_settings()
+    state = load_state()
+    sources = pactl_json("sources") or []
+    mics = [m["name"] for m in list_mics(sources)]
+    back = state["restoreSource"] if state["restoreSource"] in mics else (settings["mic"] if settings["mic"] in mics else (mics[0] if mics else ""))
+    ours = source_index(sources, NODE_SOURCE)
+    if back:
+        if default_source() == NODE_SOURCE:
+            run([PACTL, "set-default-source", back], timeout=3)
+        move_streams(app_streams_on(ours), back)
+    teardown()
+    wait_for_node(False, 4.0)
+    state["graph"] = {"lsp": False, "rnnoise": False}
+    store_json("state.json", state)
+    emit({"ok": True, "restored": back})
+
+
+def cmd_reload():
+    if demo_on():
+        emit({"ok": True, "demo": True})
+        return
+    if not unit_installed():
+        fail("Soundcheck is off")
+    settings = load_settings()
+    state = load_state()
+    sources = pactl_json("sources")
+    mic = pick_mic(settings, list_mics(sources), "")
+    graph = packages()
+    was_on = app_streams_on(source_index(sources, NODE_SOURCE))
+    write_conf(settings, graph, mic)
+    run([SYSTEMCTL, "--user", "restart", UNIT], timeout=10)
+    if wait_for_node(True) is None:
+        fail("the chain did not come back; run soundcheck off, then on")
+    state["graph"] = graph
+    store_json("state.json", state)
+    # Streams that were on the chain were moved to a fallback while it was
+    # gone; bring them back.
+    move_streams(was_on, NODE_SOURCE)
+    emit({"ok": True, "graph": graph})
+
+
+def cmd_live(text, persist):
+    settings = parse_settings_arg(text)
+    if demo_on():
+        emit({"ok": True, "demo": True})
+        return
+    state = load_state()
+    stored = load_settings()
+    # The microphone is not changed through here: that needs a stream moved,
+    # which is what `soundcheck mic` is for.
+    settings["mic"] = stored["mic"]
+    applied = apply_live(settings, state["graph"]) if unit_installed() else False
+    if persist:
+        store_json("settings.json", settings)
+        if unit_installed() and settings["mic"]:
+            write_conf(settings, state["graph"], settings["mic"])
+    emit({"ok": True, "applied": applied})
+
+
+def cmd_mic(name):
+    if not valid_name(name) or name.startswith(NODE_PREFIX):
+        fail("not a microphone name")
+    if demo_on():
+        emit({"ok": True, "demo": True})
+        return
+    mics = [m["name"] for m in list_mics(pactl_json("sources"))]
+    if name not in mics:
+        fail("that microphone is not connected")
+    settings = load_settings()
+    state = load_state()
+    settings["mic"] = name
+    store_json("settings.json", settings)
+    moved = False
+    if unit_installed():
+        write_conf(settings, state["graph"], name)
+        node = capture_node_id()
+        if node is not None:
+            rc, _, _ = run([PW_METADATA, str(node), "target.object", name], timeout=3, cap=8192)
+            moved = rc == 0
+    emit({"ok": True, "moved": moved})
+
+
+def cmd_demo(arg):
+    fd = config_dir()
+    try:
+        if arg == "on":
+            write_file(fd, DEMO_FILE, b"on\n")
+        elif arg == "off":
+            remove_file(fd, DEMO_FILE)
+        else:
+            fail("demo takes on or off")
+    finally:
+        os.close(fd)
+    emit({"ok": True, "demo": arg == "on"})
+
+
+# ------------------------------------------------------------ the meter
+
+FFT_N = 4096
+_rev = None
+_tw = None
+_win = None
+
+
+def _fft_tables():
+    global _rev, _tw, _win
+    if _rev is None:
+        bits = FFT_N.bit_length() - 1
+        _rev = [int(format(i, f"0{bits}b")[::-1], 2) for i in range(FFT_N)]
+        _tw = [cmath.exp(-2j * math.pi * k / FFT_N) for k in range(FFT_N // 2)]
+        _win = [0.5 - 0.5 * math.cos(2 * math.pi * i / (FFT_N - 1)) for i in range(FFT_N)]
+
+
+def fft_power(samples):
+    _fft_tables()
+    a = [complex(samples[r] * _win[r], 0.0) for r in _rev]
+    size = 2
+    while size <= FFT_N:
+        half = size // 2
+        tws = _tw[::FFT_N // size][:half]
+        for start in range(0, FFT_N, size):
+            for k in range(half):
+                i = start + k
+                j = i + half
+                t = tws[k] * a[j]
+                x = a[i]
+                a[i] = x + t
+                a[j] = x - t
+        size *= 2
+    # Scaled so a full-scale sine reads 0 dBFS in its bin.
+    norm = 4.0 / (sum(_win) ** 2)
+    return [(abs(a[b]) ** 2) * norm for b in range(FFT_N // 2)]
+
+
+def band_levels(power):
+    out = []
+    width = RATE / FFT_N
+    for k in range(GRID):
+        f = grid_freq(k)
+        lo, hi = f * 2 ** (-1 / 12) / width, f * 2 ** (1 / 12) / width
+        b0, b1 = int(math.ceil(lo)), int(math.floor(hi))
+        if b1 >= b0:
+            p = sum(power[b0:b1 + 1])
+        else:
+            p = power[min(len(power) - 1, int(round(f / width)))]
+        out.append(round(clamp(10 * math.log10(p + 1e-14), -120.0, 0.0), 1))
+    return out
+
+
+def level_db(samples):
+    if not samples:
+        return -120.0, -120.0
+    peak = max(abs(min(samples)), abs(max(samples)))
+    rms = math.sqrt(sum(x * x for x in samples) / len(samples))
+    return (round(clamp(20 * math.log10(rms + 1e-9), -120.0, 0.0), 1),
+            round(clamp(20 * math.log10(peak + 1e-9), -120.0, 0.0), 1))
+
+
+def record_argv(target, fmt, node_name, latency="20ms"):
+    return [PW_RECORD, "--target", target, "--rate", str(RATE), "--channels", "1",
+            "--format", fmt, "--raw", "--latency", latency,
+            "--properties", "{ node.name = " + node_name + " node.dont-fallback = true media.role = Production }",
+            "-"]
+
+
+def cmd_meter():
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    if demo_on():
+        demo_meter()
+        return
+    settings = load_settings()
+    sources = pactl_json("sources")
+    mic = pick_mic(settings, list_mics(sources), default_source())
+    if not mic:
+        fail("no microphone found")
+    chain = source_index(sources, NODE_SOURCE) is not None
+    procs = {"in": spawn(record_argv(mic, "f32", "soundcheck_meter_in"))}
+    if chain:
+        procs["out"] = spawn(record_argv(NODE_SOURCE, "f32", "soundcheck_meter_out"))
+    fds = {p.stdout.fileno(): key for key, p in procs.items()}
+    pending = {key: b"" for key in procs}
+    recent = {key: array.array("f") for key in procs}
+    ring = array.array("f", [0.0] * FFT_N)
+    next_level = next_spec = time.monotonic()
+    try:
+        while fds:
+            ready, _, _ = select.select(list(fds), [], [], 0.25)
+            for fd in ready:
+                key = fds[fd]
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    del fds[fd]
+                    continue
+                buf = pending[key] + chunk
+                usable = len(buf) - len(buf) % 4
+                pending[key] = buf[usable:]
+                samples = array.array("f")
+                samples.frombytes(buf[:usable])
+                recent[key].extend(samples)
+                if key == "in":
+                    ring.extend(samples)
+                    del ring[:len(ring) - FFT_N]
+            now = time.monotonic()
+            if now >= next_level:
+                next_level = now + 0.05
+                msg = {"type": "level"}
+                for key in procs:
+                    rms, peak = level_db(recent[key])
+                    msg[key] = rms
+                    if key == "in":
+                        msg["inPeak"] = peak
+                    del recent[key][:]
+                emit(msg)
+            if now >= next_spec:
+                next_spec = now + 0.1
+                emit({"type": "spectrum", "bands": band_levels(fft_power(ring))})
+    finally:
+        for p in procs.values():
+            kill_group(p)
+
+
+def demo_meter():
+    t = 0.0
+    while True:
+        voice = 0.5 + 0.5 * math.sin(t * 2.3) * math.sin(t * 0.7)
+        lvl = -60 + 38 * max(0.0, voice)
+        bands = []
+        for k in range(GRID):
+            f = grid_freq(k)
+            hump = -28 - 9 * (math.log2(f / 220)) ** 2 / 4
+            hiss = -78 + 4 * math.log2(f / 1000)
+            floor = -84 + (10 if 40 < f < 70 else 0)
+            v = 10 * math.log10(10 ** ((hump + 30 * (voice - 1)) / 10) + 10 ** (hiss / 10) + 10 ** (floor / 10))
+            bands.append(round(clamp(v + 2 * math.sin(t * 5 + k), -120, 0), 1))
+        emit({"type": "level", "in": round(lvl, 1), "inPeak": round(lvl + 9, 1), "out": round(lvl + 3, 1) if voice > 0.35 else -120.0})
+        if int(t * 20) % 2 == 0:
+            emit({"type": "spectrum", "bands": bands})
+        time.sleep(0.05)
+        t += 0.05
+
+
+# ---------------------------------------------------------- recording
+
+def cmd_record():
+    stop = {"now": False}
+    signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
+    signal.signal(signal.SIGINT, lambda *_: stop.update(now=True))
+    if demo_on():
+        start = time.monotonic()
+        while not stop["now"] and time.monotonic() - start < 6.4:
+            el = time.monotonic() - start
+            emit({"type": "record", "elapsed": round(el, 1), "level": round(-30 + 8 * math.sin(el * 4), 1)})
+            time.sleep(0.1)
+        emit({"type": "done", "ok": True, "seconds": 6.4, "after": True})
+        return
+    settings = load_settings()
+    sources = pactl_json("sources")
+    mic = pick_mic(settings, list_mics(sources), default_source())
+    if not mic:
+        fail("no microphone found")
+    chain = source_index(sources, NODE_SOURCE) is not None
+    try:
+        dirfd = runtime_dir()
+    except (OSError, PermissionError) as e:
+        fail(f"no private place to keep the recording: {e}")
+    targets = {"before": mic}
+    if chain:
+        targets["after"] = NODE_SOURCE
+    writers, procs = {}, {}
+    try:
+        for which in ("before", "after"):
+            remove_file(dirfd, f"{which}.wav")
+        for which, target in targets.items():
+            fd = os.open(f"{which}.wav", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dirfd)
+            w = wave.open(os.fdopen(fd, "wb"), "wb")
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(RATE)
+            writers[which] = [w, 0]
+            procs[which] = spawn(record_argv(target, "s16", f"soundcheck_record_{which}", "50ms"))
+        fds = {p.stdout.fileno(): which for which, p in procs.items()}
+        start = time.monotonic()
+        level = -120.0
+        last_emit = 0.0
+        while fds and not stop["now"]:
+            ready, _, _ = select.select(list(fds), [], [], 0.1)
+            for fd in ready:
+                which = fds[fd]
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    del fds[fd]
+                    continue
+                w = writers[which]
+                room = RECORD_BYTES - w[1]
+                chunk = chunk[:room - room % 2]
+                if chunk:
+                    w[0].writeframesraw(chunk)
+                    w[1] += len(chunk)
+                    if which == "before":
+                        samples = array.array("h")
+                        samples.frombytes(chunk[:len(chunk) - len(chunk) % 2])
+                        if samples:
+                            level = max(level - 3, 20 * math.log10(max(1, max(abs(min(samples)), abs(max(samples))))) - 90.3)
+                if w[1] >= RECORD_BYTES:
+                    del fds[fd]
+            el = time.monotonic() - start
+            if el - last_emit >= 0.1:
+                last_emit = el
+                emit({"type": "record", "elapsed": round(min(el, RECORD_SECONDS), 1), "level": round(clamp(level, -120, 0), 1)})
+            if el >= RECORD_SECONDS + 0.5:
+                break
+    finally:
+        for p in procs.values():
+            kill_group(p)
+        for w in writers.values():
+            try:
+                w[0].close()
+            except OSError:
+                pass
+        os.close(dirfd)
+    seconds = round(writers["before"][1] / (RATE * 2), 1) if "before" in writers else 0.0
+    emit({"type": "done", "ok": True, "seconds": seconds, "after": "after" in writers})
+
+
+def cmd_play(which, sink):
+    if which not in ("before", "after"):
+        fail("play takes before or after")
+    if not valid_name(sink) or sink.startswith(NODE_PREFIX):
+        fail("not an output name")
+    stop = {"now": False}
+    signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
+    if demo_on():
+        start = time.monotonic()
+        while not stop["now"] and time.monotonic() - start < 6.4:
+            emit({"type": "play", "position": round(time.monotonic() - start, 1), "length": 6.4})
+            time.sleep(0.1)
+        emit({"type": "done", "ok": True})
+        return
+    dirfd = runtime_dir()
+    try:
+        fd = open_regular(dirfd, f"{which}.wav", RECORD_BYTES + 4096)
+    finally:
+        os.close(dirfd)
+    if fd is None:
+        fail("record a test first")
+    try:
+        with wave.open(os.fdopen(fd, "rb"), "rb") as w:
+            if w.getnchannels() != 1 or w.getsampwidth() != 2 or w.getframerate() != RATE:
+                fail("the test recording is not one this plugin wrote")
+            frames = w.readframes(RECORD_BYTES // 2)
+    except (wave.Error, EOFError):
+        fail("the test recording is damaged")
+    length = len(frames) / (RATE * 2)
+    proc = spawn([PW_PLAY, "--target", sink, "--rate", str(RATE), "--channels", "1", "--format", "s16",
+                  "--raw", "--properties", "{ node.name = soundcheck_play media.role = Production }", "-"], stdin=True)
+    start = time.monotonic()
+    try:
+        view = memoryview(frames)
+        step = RATE * 2 // 10
+        while view and not stop["now"]:
+            proc.stdin.write(view[:step])
+            proc.stdin.flush()
+            view = view[step:]
+            emit({"type": "play", "position": round(min(length, time.monotonic() - start), 1), "length": round(length, 1)})
+        proc.stdin.close()
+        while proc.poll() is None and not stop["now"]:
+            emit({"type": "play", "position": round(min(length, time.monotonic() - start), 1), "length": round(length, 1)})
+            time.sleep(0.1)
+    except BrokenPipeError:
+        pass
+    finally:
+        kill_group(proc)
+    emit({"type": "done", "ok": True})
+
+
+# ------------------------------------------------------------------ main
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    try:
+        if cmd == "status":
+            emit(status())
+        elif cmd == "on":
+            cmd_on()
+        elif cmd == "off":
+            cmd_off()
+        elif cmd == "reload":
+            cmd_reload()
+        elif cmd in ("live", "save") and len(argv) == 3:
+            cmd_live(argv[2], cmd == "save")
+        elif cmd == "mic" and len(argv) == 3:
+            cmd_mic(argv[2])
+        elif cmd == "meter":
+            cmd_meter()
+        elif cmd == "record":
+            cmd_record()
+        elif cmd == "play" and len(argv) == 4:
+            cmd_play(argv[2], argv[3])
+        elif cmd == "demo" and len(argv) == 3:
+            cmd_demo(argv[2])
+        elif cmd == "render":
+            # For tests and the curious: the config `on` would write.
+            s = load_settings()
+            sys.stdout.write(render(s, packages() if len(argv) < 3 else {"lsp": True, "rnnoise": True},
+                                    s["mic"] or "alsa_input.example"))
+        else:
+            sys.stdout.write(__doc__)
+            sys.exit(2)
+    except PermissionError as e:
+        fail(str(e))
+    except OSError as e:
+        fail(f"{e.strerror or e}")
+
+
+if __name__ == "__main__":
+    main(sys.argv)

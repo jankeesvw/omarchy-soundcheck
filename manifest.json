@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "jankeesvw.soundcheck",
+  "name": "Soundcheck",
+  "version": "0.1.0",
+  "author": "Jankees",
+  "description": "Draw an EQ curve for your microphone, add a noise gate and more, test it and listen in. Every app gets the processed sound.",
+  "homepage": "https://github.com/jankeesvw/omarchy-soundcheck",
+  "license": "MIT",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Soundcheck",
+    "description": "A drawn EQ curve, noise gate, compressor and limiter in front of your microphone, with a test recording and listening in",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

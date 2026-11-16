@@ -1,0 +1,4 @@
+singleton SoundcheckStore 1.0 SoundcheckStore.qml
+CurveView 1.0 CurveView.qml
+StepRow 1.0 StepRow.qml
+LineProcess 1.0 LineProcess.qml
