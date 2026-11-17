@@ -32,6 +32,8 @@ Singleton {
   readonly property string iconPlay: "\uf04b"
   readonly property string iconCopy: "\uf0c5"
   readonly property string iconWarn: "\uf071"
+  // nf-md-auto_fix, U+F0068: a wand with sparks, for Analyse.
+  readonly property string iconWand: "\uDB80\uDC68"
 
   readonly property string sourceName: "soundcheck_mic"
 
@@ -47,12 +49,11 @@ Singleton {
   property string micLabel: ""
   property bool micPresent: false
   property var mics: []
-  // False while the running chain was built by an older version of the
-  // plugin: the gate row then offers the restart that brings it up to date.
-  property bool graphCurrent: true
   property var sinks: []
-  property var packages: ({ lsp: false, rnnoise: false })
-  property var graph: ({ lsp: false, rnnoise: false })
+  property var packages: ({ lsp: false, rnnoise: false, pitch: false })
+  // What the running chain was built with, and by which version: a step
+  // newer than that offers the restart that brings it in.
+  property var graph: ({ lsp: false, rnnoise: false, pitch: false, v: 1 })
   property var recordingInfo: ({ before: false, after: false, seconds: 0 })
 
   // On means installed: the unit exists and is meant to run. Broken means it
@@ -82,8 +83,8 @@ Singleton {
       version: 1, mic: "", monitorSink: "", curve: curve, gains: gains,
       highpass: { on: true, freq: 80 }, denoise: { on: true, amount: 50 },
       gate: { on: true, threshold: -55 }, compressor: { on: true, threshold: -24, ratio: 3 },
-      limiter: { on: true, ceiling: -1 }, distortion: { on: false, drive: 40 },
-      reverb: { on: false, amount: 30 }, gain: 0
+      limiter: { on: true, ceiling: -1 }, distortion: { on: false, kind: "warm", drive: 40 },
+      pitch: { on: false, semitones: -5 }, reverb: { on: false, amount: 30 }, gain: 0, preset: ""
     }
   }
 
@@ -107,7 +108,157 @@ Singleton {
     })
   }
 
-  function preset(id) { root.setCurve(Eq.preset(id)) }
+
+  // --- presets, fitted to your voice -----------------------------------------
+  //
+  // The helper sends every preset already worked out for the last analysis
+  // (or for a voice like most, before there is one): applying one is a copy.
+
+  property var presets: []
+  // What the last analysis found, or null: { at, sameMic, speech, noise,
+  // noiseSure, f0, findings: [{ text, urgent }] }.
+  property var analysis: null
+  property bool analysing: false
+  property string analysisError: ""
+  // Analyse: a test recording, measured, the preset fitted and applied, and
+  // then played back through it.
+  property bool analyseMode: false
+  property bool playAfterSave: false
+  // What the settings were before the last preset, while the panel is open.
+  property var undoSettings: null
+
+  // Everything a preset may set, and so everything Undo puts back.
+  readonly property var presetKeys: ["highpass", "denoise", "gate", "compressor", "limiter", "gain", "curve",
+                                     "gains", "distortion", "pitch", "reverb", "preset"]
+
+  function presetById(id) {
+    for (var i = 0; i < root.presets.length; i++) if (root.presets[i].id === id) return root.presets[i]
+    return null
+  }
+
+  function same(a, b) {
+    if (typeof a === "number" || typeof b === "number") return Math.abs(Number(a) - Number(b)) < 0.051
+    if (Array.isArray(a) || Array.isArray(b)) {
+      if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+      for (var i = 0; i < a.length; i++) if (!root.same(a[i], b[i])) return false
+      return true
+    }
+    if (a && b && typeof a === "object" && typeof b === "object") {
+      for (var k in b) if (!root.same(a[k], b[k])) return false
+      return true
+    }
+    return a === b
+  }
+
+  // The preset the settings are right now, untouched; "" once anything moved.
+  // A preset only names what it sets (Clean sets the switches and leaves
+  // the sliders), so only that is compared.
+  readonly property string currentPreset: {
+    for (var i = 0; i < root.presets.length; i++) {
+      var fit = root.presets[i].settings
+      var all = true
+      for (var k in fit) if (all) all = root.same(root.settings[k], fit[k])
+      if (all) return root.presets[i].id
+    }
+    return ""
+  }
+
+  function applyPreset(id) {
+    var p = root.presetById(id)
+    if (!p) return
+    root.undoSettings = root.copy(root.settings)
+    root.change(function(s) {
+      for (var k in p.settings) {
+        var v = root.copy(p.settings[k])
+        if (v && typeof v === "object" && !Array.isArray(v) && s[k] && typeof s[k] === "object")
+          for (var f in v) s[k][f] = v[f]
+        else
+          s[k] = v
+      }
+      s.gains = Eq.solve(s.curve)
+      s.preset = id
+    })
+  }
+
+  function undoPreset() {
+    var u = root.undoSettings
+    if (!u) return
+    root.undoSettings = null
+    root.change(function(s) {
+      for (var j = 0; j < root.presetKeys.length; j++)
+        if (u[root.presetKeys[j]] !== undefined) s[root.presetKeys[j]] = root.copy(u[root.presetKeys[j]])
+    })
+  }
+
+  onViewersChanged: if (root.viewers === 0) root.undoSettings = null
+
+  function analyse() {
+    if (root.recording) { if (root.analyseMode) recordProc.signal(15); return }
+    if (root.analysing || root.busy) return
+    root.analysisError = ""
+    root.analyseMode = true
+    root.startRecord()
+  }
+
+  function runAnalysis() {
+    if (analyseProc.running) return
+    root.analysing = true
+    analyseProc.running = true
+  }
+
+  LineProcess {
+    id: analyseProc
+    command: root.argv(["analyse"])
+    handler: function(r) {
+      // A plain test that cannot be measured (stopped early, say) keeps the
+      // last analysis and says nothing: only Analyse asked for one.
+      if (r.ok === false) { if (root.analyseMode) root.analysisError = root.text(r.error, 200); return }
+      root.analysisError = ""
+      root.applyAnalysis(r.analysis, r.presets)
+      if (root.analyseMode) {
+        // The preset chosen last, if Analyse has something to fit in it.
+        var last = root.presetById(root.settings.preset)
+        root.applyPreset(last && last.fitted ? last.id : "call")
+        // Saved before it plays: the preview starts from what is on disk.
+        root.playAfterSave = true
+        saveTimer.stop()
+        root.save()
+      }
+    }
+    onRunningChanged: if (!running) { root.analysing = false; root.analyseMode = false }
+  }
+
+  // The status poll brings the same presets every few seconds: only a
+  // change is passed on, so the buttons are not rebuilt under the cursor.
+  property string analysisSeen: ""
+
+  function applyAnalysis(a, list) {
+    var seen = JSON.stringify([a, list])
+    if (seen === root.analysisSeen) return
+    root.analysisSeen = seen
+    var out = []
+    if (Array.isArray(list)) {
+      for (var i = 0; i < list.length && out.length < 8; i++) {
+        var p = list[i]
+        if (!p || typeof p.id !== "string" || !/^[a-z]{1,20}$/.test(p.id) || !p.settings || typeof p.settings !== "object") continue
+        if (!Array.isArray(p.settings.curve) || p.settings.curve.length !== Eq.GRID) continue
+        out.push({ id: p.id, label: root.label(p.label || p.id), fitted: p.fitted !== false, settings: p.settings })
+      }
+    }
+    root.presets = out
+    if (!a || typeof a !== "object") { root.analysis = null; return }
+    var found = []
+    if (Array.isArray(a.findings)) {
+      for (var j = 0; j < a.findings.length && found.length < 6; j++) {
+        var f = a.findings[j]
+        if (f && typeof f.text === "string") found.push({ text: root.text(f.text, 240), urgent: f.urgent === true })
+      }
+    }
+    root.analysis = {
+      at: Number(a.at) || 0, sameMic: a.sameMic === true, noiseSure: a.noiseSure === true,
+      speech: Number(a.speech) || 0, noise: Number(a.noise) || 0, f0: Number(a.f0) || 0, findings: found
+    }
+  }
 
   function toggleBypass() {
     root.bypass = !root.bypass
@@ -122,6 +273,7 @@ Singleton {
     s.highpass.on = false; s.denoise.on = false; s.gate.on = false
     s.compressor.on = false; s.limiter.on = false; s.gain = 0
     if (s.distortion) s.distortion.on = false
+    if (s.pitch) s.pitch.on = false
     if (s.reverb) s.reverb.on = false
     for (var i = 0; i < s.gains.length; i++) s.gains[i] = 0
     return s
@@ -160,13 +312,16 @@ Singleton {
     root.micPresent = s.micPresent === true
     root.mics = root.cleanDevices(s.mics)
     root.sinks = root.cleanDevices(s.sinks)
-    root.packages = { lsp: !!(s.packages && s.packages.lsp), rnnoise: !!(s.packages && s.packages.rnnoise) }
-    root.graph = { lsp: !!(s.graph && s.graph.lsp), rnnoise: !!(s.graph && s.graph.rnnoise) }
-    root.graphCurrent = s.graphCurrent !== false
+    root.packages = { lsp: !!(s.packages && s.packages.lsp), rnnoise: !!(s.packages && s.packages.rnnoise),
+                      pitch: !!(s.packages && s.packages.pitch) }
+    var v = Number(s.graph && s.graph.v)
+    root.graph = { lsp: !!(s.graph && s.graph.lsp), rnnoise: !!(s.graph && s.graph.rnnoise),
+                   pitch: !!(s.graph && s.graph.pitch), v: isFinite(v) ? v : 1 }
     root.recordingInfo = {
       before: !!(s.recording && s.recording.before), after: !!(s.recording && s.recording.after),
       seconds: Number(s.recording && s.recording.seconds) || 0
     }
+    root.applyAnalysis(s.analysis, s.presets)
     if (!root.dirty && s.settings && typeof s.settings === "object") {
       var next = s.settings
       // The demo ships a curve, not band gains: the solver lives here, so the
@@ -180,8 +335,10 @@ Singleton {
   // Device names come from the devices. They are rendered as plain text, and
   // also pass through here so they stay short and carry no markup on their way
   // to the shell's own dropdown and tooltip, whose text format is not ours.
-  function label(value) {
-    return String(value === undefined || value === null ? "" : value).replace(/[<>&\u0000-\u001f\u007f-\u009f‎‏‪-‮⁦-⁩]/g, "").slice(0, 60)
+  function label(value) { return root.text(value, 60) }
+
+  function text(value, cap) {
+    return String(value === undefined || value === null ? "" : value).replace(/[<>&\u0000-\u001f\u007f-\u009f‎‏‪-‮⁦-⁩]/g, "").slice(0, cap)
   }
 
   function validName(name) {
@@ -231,7 +388,11 @@ Singleton {
   LineProcess {
     id: saveProc
     handler: function(r) { if (r.ok === false) root.error = root.label(r.error) }
-    onRunningChanged: if (!running && !saveTimer.running) { root.dirty = false; root.refresh() }
+    onRunningChanged: if (!running && !saveTimer.running) {
+      root.dirty = false
+      root.refresh()
+      if (root.playAfterSave) { root.playAfterSave = false; root.play("after") }
+    }
   }
 
   // On, off and reload change the system's default input, so they run one at
@@ -272,6 +433,8 @@ Singleton {
   property real levelIn: -120
   property real levelPeak: -120
   property real levelOut: -120
+  // The output's peak may go over 0 dB: that is what clips in an app.
+  property real levelOutPeak: -120
   property var spectrum: []
   // What the chain sends on, measured the same way. Empty while it is off.
   property var spectrumOut: []
@@ -317,6 +480,7 @@ Singleton {
         root.levelIn = root.db(m.in)
         root.levelPeak = root.db(m.inPeak)
         root.levelOut = root.db(m.out)
+        root.levelOutPeak = root.db(m.outPeak, 12)
         var h = root.gateHistory.slice(Math.max(0, root.gateHistory.length - root.gateHistoryLength + 1))
         // The average level, not the peak: that is what the gate listens to.
         h.push({ l: root.levelIn, o: root.present && root.levelOut > -100 })
@@ -330,7 +494,7 @@ Singleton {
       }
     }
     onRunningChanged: if (!running) {
-      root.levelIn = -120; root.levelPeak = -120; root.levelOut = -120
+      root.levelIn = -120; root.levelPeak = -120; root.levelOut = -120; root.levelOutPeak = -120
       root.spectrum = []
       root.spectrumOut = []
       root.spectrumPeaks = []
@@ -350,9 +514,9 @@ Singleton {
     return out
   }
 
-  function db(v) {
+  function db(v, top) {
     var n = Number(v)
-    return isFinite(n) ? Math.max(-120, Math.min(0, n)) : -120
+    return isFinite(n) ? Math.max(-120, Math.min(top === undefined ? 0 : top, n)) : -120
   }
 
   // --- listening in ----------------------------------------------------------
@@ -457,6 +621,11 @@ Singleton {
 
   function toggleRecord() {
     if (root.recording) { recordProc.signal(15); return }
+    root.analyseMode = false
+    root.startRecord()
+  }
+
+  function startRecord() {
     if (root.playing) playProc.signal(15)
     root.recordElapsed = 0
     root.recording = true
@@ -476,12 +645,19 @@ Singleton {
         root.autoplay = true
       } else if (m.ok === false) {
         root.error = root.label(m.error)
+        root.analyseMode = false
       }
     }
     onRunningChanged: if (!running) {
       root.recording = false
-      // Straight back to you: the point of a test is hearing it.
-      if (root.autoplay) { root.autoplay = false; root.play(root.listenTo) }
+      var recorded = root.autoplay
+      root.autoplay = false
+      // Every test is measured, so the presets fit the latest one. Analyse
+      // waits for it and plays the test back through the fitted preset;
+      // a plain test plays straight back: the point of it is hearing it.
+      if (recorded) root.runAnalysis()
+      else root.analyseMode = false
+      if (recorded && !root.analyseMode) root.play(root.listenTo)
       root.refresh()
     }
   }
@@ -543,5 +719,6 @@ Singleton {
     if (meterProc.running) meterProc.signal(15)
     if (recordProc.running) recordProc.signal(15)
     if (playProc.running) playProc.signal(15)
+    if (analyseProc.running) analyseProc.signal(15)
   }
 }

@@ -16,6 +16,10 @@ import "Eq.js" as Eq
 // sends on. In front: what you painted (filled), and what the filters together
 // with the high-pass actually do (the thin line). That last one is computed
 // with the same formulas PipeWire runs, so it is what you hear.
+//
+// Each of those has a colour of its own, named in the legend under the graph:
+// the curve in the accent, the microphone and the output in two hues picked
+// to stand apart from the accent and from each other.
 Item {
   id: view
 
@@ -43,13 +47,16 @@ Item {
   signal committed()
 
   activeFocusOnTab: true
-  implicitHeight: Style.space(210)
+  implicitHeight: Style.space(210) + legendBand
 
   readonly property real fMin: 20
   readonly property real fMax: 20000
   readonly property real dbRange: 15
   readonly property real padTop: Style.space(8)
-  readonly property real padBottom: Style.space(20)
+  // Under the plot: the frequencies, then the legend outside the card.
+  readonly property real legendBand: Style.space(22)
+  readonly property real padBottom: Style.space(20) + legendBand
+  readonly property real cardH: height - legendBand
   readonly property real plotH: Math.max(10, height - padTop - padBottom)
 
   function xOf(freq) { return width * Math.log(freq / fMin) / Math.log(fMax / fMin) }
@@ -64,6 +71,28 @@ Item {
     return Qt.rgba(c.r + (bg.r - c.r) * amount, c.g + (bg.g - c.g) * amount, c.b + (bg.b - c.b) * amount, 1)
   }
   function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
+
+  // The hues of the microphone and the output: the first of each list that
+  // is far enough round the colour wheel from the accent, so neither reads
+  // as the curve. A grey accent leaves the first of each.
+  readonly property bool darkTheme: background.r * 0.299 + background.g * 0.587 + background.b * 0.114 < 0.5
+  function hueAway(candidates, avoid) {
+    for (var i = 0; i < candidates.length; i++) {
+      var ok = true
+      for (var j = 0; j < avoid.length; j++) {
+        var d = Math.abs(candidates[i] - avoid[j])
+        if (Math.min(d, 1 - d) < 0.12) ok = false
+      }
+      if (ok) return candidates[i]
+    }
+    return candidates[0]
+  }
+  readonly property var accentHues: accent.hslSaturation > 0.2 ? [accent.hslHue] : []
+  readonly property real micHue: hueAway([0.53, 0.78, 0.36], accentHues)            // cyan, violet, green
+  readonly property real outHue: hueAway([0.10, 0.95, 0.36], accentHues.concat([micHue]))  // amber, pink, green
+  function tone(hue) { return Qt.hsla(hue, darkTheme ? 0.65 : 0.7, darkTheme ? 0.62 : 0.42, 1) }
+  readonly property color micColor: tone(micHue)
+  readonly property color outColor: tone(outHue)
 
   // While dragging, the painted curve is redrawn from a local copy at once;
   // the solver and PipeWire hear about it at most every 40 ms.
@@ -185,7 +214,8 @@ Item {
   // ---- drawing -----------------------------------------------------------
 
   Rectangle {
-    anchors.fill: parent
+    width: parent.width
+    height: view.cardH
     radius: Style.cornerRadius > 0 ? Style.space(6) : 0
     color: view.alpha(view.foreground, 0.035)
     border.width: view.activeFocus ? Math.max(1, Style.space(2)) : 1
@@ -257,21 +287,21 @@ Item {
     ShapePath {
       strokeWidth: 0
       strokeColor: "transparent"
-      fillColor: view.alpha(view.foreground, view.spectrumPoints.length ? (view.hasOutput ? 0.11 : 0.15) : 0)
+      fillColor: view.alpha(view.micColor, view.spectrumPoints.length ? (view.hasOutput ? 0.16 : 0.22) : 0)
       PathPolyline { path: view.spectrumPoints.length ? view.spectrumPoints : [Qt.point(0, 0)] }
     }
     ShapePath {
       strokeWidth: 1
-      strokeColor: view.alpha(view.foreground, view.spectrumEdge.length ? (view.hasOutput ? 0.3 : 0.5) : 0)
+      strokeColor: view.alpha(view.micColor, view.spectrumEdge.length ? (view.hasOutput ? 0.5 : 0.7) : 0)
       fillColor: "transparent"
       joinStyle: ShapePath.RoundJoin
       PathPolyline { path: view.spectrumEdge.length ? view.spectrumEdge : [Qt.point(0, 0)] }
     }
 
-    // The loudest each frequency has been lately, dotted.
+    // The loudest each frequency has been lately: the microphone's colour, dotted.
     ShapePath {
-      strokeWidth: 1
-      strokeColor: view.alpha(view.foreground, view.peakLine.length ? 0.55 : 0)
+      strokeWidth: Math.max(1, Style.space(1.2))
+      strokeColor: view.alpha(view.micColor, view.peakLine.length ? 0.95 : 0)
       fillColor: "transparent"
       strokeStyle: ShapePath.DashLine
       dashPattern: [2, 3]
@@ -282,8 +312,8 @@ Item {
     // What the chain sends on: where it parts from the spectrum below is
     // where the chain changed something.
     ShapePath {
-      strokeWidth: Math.max(1, Style.space(1.2))
-      strokeColor: view.alpha(view.foreground, view.hasOutput ? 0.8 : 0)
+      strokeWidth: Math.max(1.5, Style.space(1.6))
+      strokeColor: view.alpha(view.outColor, view.hasOutput ? 0.95 : 0)
       fillColor: "transparent"
       joinStyle: ShapePath.RoundJoin
       PathPolyline { path: view.hasOutput ? view.outputLine : [Qt.point(0, 0)] }
@@ -330,7 +360,7 @@ Item {
       radius: width / 2
       x: loudMark.fx - width / 2
       y: loudMark.fy - height / 2
-      color: view.foreground
+      color: view.micColor
     }
 
     Rectangle {
@@ -419,53 +449,63 @@ Item {
     font.letterSpacing: 1.2
   }
 
-  // On a plate of the background, because the spectrum fills this corner.
-  Rectangle {
-    visible: legend.visible
-    x: legend.x - Style.space(5)
-    y: legend.y - Style.space(2)
-    width: legend.width + Style.space(10)
-    height: legend.height + Style.space(4)
-    radius: Style.cornerRadius > 0 ? Style.space(3) : 0
-    color: view.alpha(view.background, 0.85)
-  }
-
+  // Under the card: every line in the graph, with its colour and its style.
   Row {
     id: legend
-    visible: view.spectrumPoints.length > 0
-    anchors.right: parent.right
-    anchors.rightMargin: Style.space(10)
-    y: view.padTop + view.plotH - height - Style.space(6)
-    spacing: Style.space(10)
+    x: Style.space(2)
+    y: view.cardH + Math.round((view.legendBand - height) / 2)
+    spacing: Style.space(12)
 
     Repeater {
-      model: [{ label: view.inputLabel, kind: "fill" }, { label: "Peak", kind: "dots" }]
-             .concat(view.hasOutput ? [{ label: "Soundcheck output", kind: "line" }] : [])
+      // w and a: the width and opacity of the line in the graph.
+      model: [{ label: "Your curve", kind: "curve", c: view.accent, w: 2, a: 0.95, on: true },
+              { label: "Filters", kind: "line", c: view.foreground, w: 1.2, a: 0.75, on: true },
+              { label: view.inputLabel, kind: "fill", c: view.micColor, w: 1, a: 0.7, on: view.spectrumPoints.length > 0 },
+              { label: "Peak", kind: "dots", c: view.micColor, w: 1.2, a: 0.95, on: view.peakLine.length > 0 },
+              { label: "Soundcheck output", kind: "line", c: view.outColor, w: 1.6, a: 0.95, on: view.hasOutput }]
       delegate: Row {
+        id: entry
         required property var modelData
-        spacing: Style.space(4)
-        Rectangle {
-          visible: modelData.kind !== "dots"
+        visible: modelData.on
+        spacing: Style.space(5)
+
+        Item {
           anchors.verticalCenter: parent.verticalCenter
-          width: Style.space(12)
-          height: modelData.kind === "line" ? Math.max(1, Style.space(1.2)) : Style.space(7)
-          color: view.alpha(view.foreground, modelData.kind === "line" ? 0.8 : 0.22)
-          border.width: modelData.kind === "fill" ? 1 : 0
-          border.color: view.alpha(view.foreground, 0.5)
-        }
-        Row {
-          visible: modelData.kind === "dots"
-          anchors.verticalCenter: parent.verticalCenter
-          spacing: 3
-          Repeater {
-            model: 3
-            delegate: Rectangle { width: 2; height: 1; color: view.alpha(view.foreground, 0.7) }
+          width: Style.space(14)
+          height: Style.space(9)
+
+          Rectangle {
+            visible: modelData.kind === "fill" || modelData.kind === "curve"
+            anchors.fill: parent
+            color: view.alpha(modelData.c, 0.25)
+            Rectangle {
+              width: parent.width
+              height: Math.max(1, Style.space(entry.modelData.w))
+              color: view.alpha(entry.modelData.c, entry.modelData.a)
+            }
+          }
+          Rectangle {
+            visible: modelData.kind === "line"
+            anchors.verticalCenter: parent.verticalCenter
+            width: parent.width
+            height: Math.max(1.5, Style.space(modelData.w))
+            color: view.alpha(modelData.c, modelData.a)
+          }
+          Row {
+            visible: modelData.kind === "dots"
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 2
+            Repeater {
+              model: 4
+              delegate: Rectangle { width: 2; height: Math.max(1.5, Style.space(entry.modelData.w)); color: entry.modelData.c }
+            }
           }
         }
         Text {
+          anchors.verticalCenter: parent.verticalCenter
           text: modelData.label
           textFormat: Text.PlainText
-          color: view.fade(view.foreground, 0.5)
+          color: view.fade(view.foreground, 0.4)
           font.family: view.fontFamily
           font.pixelSize: Math.round(Style.font.caption * 0.9)
         }
@@ -475,7 +515,8 @@ Item {
 
   MouseArea {
     id: mouse
-    anchors.fill: parent
+    width: parent.width
+    height: view.cardH
     acceptedButtons: Qt.LeftButton | Qt.RightButton
     hoverEnabled: true
     preventStealing: true

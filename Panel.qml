@@ -3,7 +3,6 @@ import QtQuick.Controls
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
-import "Eq.js" as Eq
 
 // Soundcheck: a curve you draw, a noise gate and a few more steps in front of
 // your microphone, so every app gets the processed sound. Plus a short test
@@ -134,6 +133,7 @@ Panel {
         else if (event.key === Qt.Key_R && !(event.modifiers & Qt.ControlModifier)) { store.toggleRecord(); event.accepted = true }
         else if (event.key === Qt.Key_P && !(event.modifiers & Qt.ControlModifier)) { if (store.canPlay) store.togglePlay(); event.accepted = true }
         else if (event.key === Qt.Key_L && !(event.modifiers & Qt.ControlModifier)) { store.setMonitoring(!store.monitoring); event.accepted = true }
+        else if (event.key === Qt.Key_A && !(event.modifiers & Qt.ControlModifier)) { store.analyse(); event.accepted = true }
       }
 
       Flickable {
@@ -262,6 +262,94 @@ Panel {
 
           PanelSeparator { width: parent.width; foreground: root.foreground }
 
+          // ---- presets: ways of treating a voice, fitted to yours by Analyse
+          Item {
+            width: parent.width
+            implicitHeight: Math.max(presetHeader.implicitHeight, presetActions.implicitHeight)
+
+            PanelSectionHeader {
+              id: presetHeader
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              text: "PRESET"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Row {
+              id: presetActions
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(4)
+
+              Button {
+                visible: store.undoSettings !== null
+                text: "Undo"
+                focusable: true
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                foreground: root.foreground
+                accent: root.accent
+                verticalPadding: Style.space(3)
+                onClicked: store.undoPreset()
+              }
+
+              Button {
+                readonly property bool listening: store.analyseMode && store.recording
+                text: listening ? "Stop" : store.analysing ? "Measuring" : "Analyse"
+                iconText: listening ? store.iconStop : store.iconWand
+                focusable: true
+                bordered: true
+                foreground: listening ? root.urgent : root.foreground
+                accent: root.accent
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                iconSize: Style.font.caption
+                verticalPadding: Style.space(3)
+                onClicked: store.analyse()
+              }
+            }
+          }
+
+          ButtonGroup {
+            options: store.presets.map(function(p) { return { value: p.id, label: p.label } })
+            value: store.currentPreset
+            spacing: Style.space(4)
+            foreground: root.foreground
+            background: root.background
+            accent: root.accent
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            onChanged: function(v) { store.applyPreset(v) }
+          }
+
+          Text {
+            width: parent.width
+            text: root.presetLine
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            color: store.analysisError !== "" ? root.urgent : root.fade(root.foreground, 0.35)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Repeater {
+            model: store.analysis && store.analysis.sameMic && !store.analyseMode && store.analysisError === ""
+                   ? store.analysis.findings : []
+            delegate: Text {
+              required property var modelData
+              width: column.width
+              text: modelData.text
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              color: modelData.urgent ? root.urgent : root.fade(root.foreground, 0.35)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          PanelSeparator { width: parent.width; foreground: root.foreground }
+
           // ---- the curve
           Item {
             width: parent.width
@@ -282,21 +370,6 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(4)
 
-              Repeater {
-                model: Eq.PRESETS
-                delegate: Button {
-                  required property var modelData
-                  text: modelData.label
-                  focusable: true
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  foreground: root.foreground
-                  accent: root.accent
-                  verticalPadding: Style.space(3)
-                  onClicked: store.preset(modelData.id)
-                }
-              }
-
               Button {
                 text: "Bypass"
                 focusable: true
@@ -312,31 +385,53 @@ Panel {
             }
           }
 
-          CurveView {
-            id: curve
+          // The graph, and beside it how loud: whether anything clips.
+          Row {
             width: parent.width
-            target: store.settings.curve
-            gains: store.settings.gains
-            highpassOn: store.settings.highpass.on
-            highpassFreq: store.settings.highpass.freq
-            spectrum: store.spectrum
-            spectrumOut: store.spectrumOut
-            peaks: store.spectrumPeaks
-            inputLabel: store.meterTap !== "" ? "Test recording" : "Microphone"
-            spectrumTop: store.spectrumTop
-            bypassed: store.bypass
-            foreground: root.foreground
-            accent: root.accent
-            background: root.background
-            fontFamily: root.fontFamily
-            onEdited: function(c) { store.setCurve(c) }
+            spacing: Style.space(8)
+
+            CurveView {
+              id: curve
+              width: parent.width - levels.width - parent.spacing
+              target: store.settings.curve
+              gains: store.settings.gains
+              highpassOn: store.settings.highpass.on
+              highpassFreq: store.settings.highpass.freq
+              spectrum: store.spectrum
+              spectrumOut: store.spectrumOut
+              peaks: store.spectrumPeaks
+              inputLabel: store.meterTap !== "" ? "Test recording" : "Microphone"
+              spectrumTop: store.spectrumTop
+              bypassed: store.bypass
+              foreground: root.foreground
+              accent: root.accent
+              background: root.background
+              fontFamily: root.fontFamily
+              onEdited: function(c) { store.setCurve(c) }
+            }
+
+            LevelMeter {
+              id: levels
+              height: curve.height
+              padTop: curve.padTop
+              padBottom: curve.padBottom
+              inLevel: store.levelIn
+              inPeak: store.levelPeak
+              outLevel: store.levelOut
+              outPeak: store.levelOutPeak
+              hasOutput: store.spectrumOut.length > 0
+              foreground: root.foreground
+              background: root.background
+              urgent: root.urgent
+              fontFamily: root.fontFamily
+            }
           }
 
           PanelSeparator { width: parent.width; foreground: root.foreground }
 
-          // ---- the chain, in the order the sound goes through it
+          // ---- the sound: what makes your voice clean, in the order it goes through
           PanelSectionHeader {
-            text: "CHAIN"
+            text: "SOUND"
             foreground: root.foreground
             fontFamily: root.fontFamily
           }
@@ -388,7 +483,7 @@ Panel {
               width: chain.width
               bar: root.bar
               title: "Noise gate"
-              mode: store.on && !store.graphCurrent ? "restart" : "ready"
+              mode: store.on && store.graph.v < 2 ? "restart" : "ready"
               restartText: "Soundcheck has a new noise gate. Restarting the chain puts it in (a second of silence on the microphone)."
               onRestartRequested: store.reload()
               checked: store.settings.gate.on
@@ -443,44 +538,6 @@ Panel {
 
             }
 
-            // The two for fun: grit and a room. Built into PipeWire, nothing
-            // to install; a chain from an older version needs one restart.
-            Row {
-              spacing: Style.space(14)
-
-              StepRow {
-                width: chain.cell
-                bar: root.bar
-                title: "Distortion"
-                mode: store.on && !store.graphCurrent ? "restart" : "ready"
-                restartText: "New in Soundcheck. Restarting the chain adds it (a second of silence on the microphone)."
-                checked: store.settings.distortion.on
-                minimum: 0; maximum: 100; step: 1; bigStep: 10
-                value: store.settings.distortion.drive
-                valueText: Math.round(store.settings.distortion.drive) + "%"
-                foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
-                onToggled: store.change(function(s) { s.distortion.on = !s.distortion.on })
-                onMoved: function(v) { store.change(function(s) { s.distortion.drive = Math.round(v) }) }
-                onRestartRequested: store.reload()
-              }
-
-              StepRow {
-                width: chain.cell
-                bar: root.bar
-                title: "Reverb"
-                mode: store.on && !store.graphCurrent ? "restart" : "ready"
-                restartText: "New in Soundcheck. Restarting the chain adds it (a second of silence on the microphone)."
-                checked: store.settings.reverb.on
-                minimum: 0; maximum: 100; step: 1; bigStep: 10
-                value: store.settings.reverb.amount
-                valueText: Math.round(store.settings.reverb.amount) + "%"
-                foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
-                onToggled: store.change(function(s) { s.reverb.on = !s.reverb.on })
-                onMoved: function(v) { store.change(function(s) { s.reverb.amount = Math.round(v) }) }
-                onRestartRequested: store.reload()
-              }
-            }
-
             StepRow {
               width: chain.width
               bar: root.bar
@@ -496,12 +553,94 @@ Panel {
 
           PanelSeparator { width: parent.width; foreground: root.foreground }
 
+          // ---- effects: for fun rather than for a clean voice. Where they sit
+          // in the chain is in the helper's render().
+          PanelSectionHeader {
+            text: "EFFECTS"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
+          Column {
+            id: effects
+            width: parent.width
+            spacing: Style.space(6)
+            readonly property real cell: (width - Style.space(14)) / 2
+            readonly property string newText: "New in Soundcheck. Restarting the chain adds it (a second of silence on the microphone)."
+
+            StepRow {
+              width: effects.width
+              bar: root.bar
+              title: "Distortion"
+              mode: store.on && store.graph.v < 4 ? "restart" : "ready"
+              restartText: store.graph.v < 3 ? effects.newText
+                         : "Soundcheck has new kinds of distortion. Restarting the chain adds them (a second of silence on the microphone)."
+              checked: store.settings.distortion.on
+              minimum: 0; maximum: 100; step: 1; bigStep: 10
+              value: store.settings.distortion.drive
+              valueText: Math.round(store.settings.distortion.drive) + "% drive"
+              choices: [{ value: "warm", label: "Warm" }, { value: "hard", label: "Hard" },
+                        { value: "fuzz", label: "Fuzz" }, { value: "radio", label: "Radio" }]
+              choice: store.settings.distortion.kind || "warm"
+              foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
+              onToggled: store.change(function(s) { s.distortion.on = !s.distortion.on })
+              onMoved: function(v) { store.change(function(s) { s.distortion.drive = Math.round(v) }) }
+              onChose: function(v) { store.change(function(s) { s.distortion.kind = v }) }
+              onRestartRequested: store.reload()
+            }
+
+            Row {
+              spacing: Style.space(14)
+
+              StepRow {
+                width: effects.cell
+                bar: root.bar
+                title: "Pitch"
+                mode: !store.packages.pitch ? "missing" : (store.on && !store.graph.pitch ? "restart" : "ready")
+                packageName: "rubberband-ladspa"
+                checked: store.settings.pitch.on
+                minimum: -12; maximum: 12; step: 1; bigStep: 12
+                value: store.settings.pitch.semitones
+                valueText: (store.settings.pitch.semitones > 0 ? "+" : "") + store.settings.pitch.semitones
+                           + (Math.abs(store.settings.pitch.semitones) === 1 ? " semitone" : " semitones")
+                foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
+                onToggled: store.change(function(s) { s.pitch.on = !s.pitch.on })
+                onMoved: function(v) { store.change(function(s) { s.pitch.semitones = Math.round(v) }) }
+                onCopyRequested: store.copyCommand("omarchy pkg add rubberband-ladspa")
+                onRestartRequested: store.reload()
+              }
+
+              StepRow {
+                width: effects.cell
+                bar: root.bar
+                title: "Reverb"
+                mode: store.on && store.graph.v < 3 ? "restart" : "ready"
+                restartText: effects.newText
+                checked: store.settings.reverb.on
+                minimum: 0; maximum: 100; step: 1; bigStep: 10
+                value: store.settings.reverb.amount
+                valueText: Math.round(store.settings.reverb.amount) + "%"
+                foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
+                onToggled: store.change(function(s) { s.reverb.on = !s.reverb.on })
+                onMoved: function(v) { store.change(function(s) { s.reverb.amount = Math.round(v) }) }
+                onRestartRequested: store.reload()
+              }
+            }
+          }
+
+          PanelSeparator { width: parent.width; foreground: root.foreground }
+
           // ---- a test, and listening in
           Row {
             id: bottom
             width: parent.width
             spacing: Style.space(14)
             readonly property real cell: (width - spacing) / 2
+            // The two columns line up row by row: both headers on one line
+            // (the switch makes Listen in's the taller), the controls on the
+            // next, the explanations under both.
+            readonly property real headHeight: Math.max(testHeader.implicitHeight, listenToggle.implicitHeight)
+            readonly property real controlHeight: Math.max(testControls.implicitHeight, sinkPicker.implicitHeight)
 
             Column {
               width: bottom.cell
@@ -509,10 +648,11 @@ Panel {
 
               Item {
                 width: parent.width
-                implicitHeight: testHeader.implicitHeight
+                implicitHeight: bottom.headHeight
 
                 PanelSectionHeader {
                   id: testHeader
+                  anchors.verticalCenter: parent.verticalCenter
                   text: "TEST"
                   foreground: root.foreground
                   fontFamily: root.fontFamily
@@ -531,47 +671,54 @@ Panel {
                 }
               }
 
-              Row {
-                spacing: Style.space(6)
+              Item {
+                width: parent.width
+                implicitHeight: bottom.controlHeight
 
-                Button {
-                  text: store.recording ? "Stop" : "Record"
-                  iconText: store.recording ? store.iconStop : store.iconRecord
-                  focusable: true
-                  bordered: true
-                  foreground: store.recording ? root.urgent : root.foreground
-                  accent: root.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  iconSize: Style.font.caption
-                  onClicked: store.toggleRecord()
-                }
+                Row {
+                  id: testControls
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(6)
 
-                Button {
-                  text: store.playing ? "Stop" : "Play"
-                  iconText: store.playing ? store.iconStop : store.iconPlay
-                  focusable: true
-                  bordered: true
-                  enabled: store.canPlay
-                  opacity: store.canPlay ? 1 : 0.45
-                  foreground: root.foreground
-                  accent: root.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  iconSize: Style.font.caption
-                  onClicked: store.togglePlay()
-                }
+                  Button {
+                    text: store.recording ? "Stop" : "Record"
+                    iconText: store.recording ? store.iconStop : store.iconRecord
+                    focusable: true
+                    bordered: true
+                    foreground: store.recording ? root.urgent : root.foreground
+                    accent: root.accent
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    iconSize: Style.font.caption
+                    onClicked: store.toggleRecord()
+                  }
 
-                ButtonGroup {
-                  visible: store.hasAfter
-                  options: [{ value: "before", label: "Before" }, { value: "after", label: "After" }]
-                  value: store.listenTo
-                  foreground: root.foreground
-                  background: root.background
-                  accent: root.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  onChanged: function(v) { store.setListenTo(v) }
+                  Button {
+                    text: store.playing ? "Stop" : "Play"
+                    iconText: store.playing ? store.iconStop : store.iconPlay
+                    focusable: true
+                    bordered: true
+                    enabled: store.canPlay
+                    opacity: store.canPlay ? 1 : 0.45
+                    foreground: root.foreground
+                    accent: root.accent
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    iconSize: Style.font.caption
+                    onClicked: store.togglePlay()
+                  }
+
+                  ButtonGroup {
+                    visible: store.hasAfter
+                    options: [{ value: "before", label: "Before" }, { value: "after", label: "After" }]
+                    value: store.listenTo
+                    foreground: root.foreground
+                    background: root.background
+                    accent: root.accent
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onChanged: function(v) { store.setListenTo(v) }
+                  }
                 }
               }
 
@@ -593,7 +740,7 @@ Panel {
 
               Item {
                 width: parent.width
-                implicitHeight: Math.max(listenHeader.implicitHeight, listenToggle.implicitHeight)
+                implicitHeight: bottom.headHeight
 
                 PanelSectionHeader {
                   id: listenHeader
@@ -629,18 +776,25 @@ Panel {
                 }
               }
 
-              Dropdown {
+              Item {
                 width: parent.width
-                showLabel: false
-                value: store.monitorSink
-                // Without headphones nothing is picked for you, on purpose:
-                // the placeholder says so instead of an empty box.
-                options: (store.monitorSink === "" ? [{ value: "", label: "Choose an output" }] : [])
-                         .concat(store.sinks.map(function(s) { return { value: s.name, label: s.label } }))
-                foreground: root.foreground
-                accent: root.accent
-                fontFamily: root.fontFamily
-                onChanged: function(v) { store.setMonitorSink(v) }
+                implicitHeight: bottom.controlHeight
+
+                Dropdown {
+                  id: sinkPicker
+                  width: parent.width
+                  anchors.verticalCenter: parent.verticalCenter
+                  showLabel: false
+                  value: store.monitorSink
+                  // Without headphones nothing is picked for you, on purpose:
+                  // the placeholder says so instead of an empty box.
+                  options: (store.monitorSink === "" ? [{ value: "", label: "Choose an output" }] : [])
+                           .concat(store.sinks.map(function(s) { return { value: s.name, label: s.label } }))
+                  foreground: root.foreground
+                  accent: root.accent
+                  fontFamily: root.fontFamily
+                  onChanged: function(v) { store.setMonitorSink(v) }
+                }
               }
 
               Text {
@@ -670,7 +824,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: "Drag to paint, right-drag to flatten, double-click for flat. Arrows nudge the curve when it has focus. R records, P plays, L listens in, B bypasses, Esc closes."
+            text: "Drag to paint, right-drag to flatten, double-click for flat. Arrows nudge the curve when it has focus. A analyses, R records, P plays, L listens in, B bypasses, Esc closes."
             textFormat: Text.PlainText
             wrapMode: Text.WordWrap
             color: root.fade(root.foreground, 0.55)
@@ -680,6 +834,23 @@ Panel {
         }
       }
     }
+  }
+
+  // Under the presets: what Analyse is doing, or what the last one measured.
+  readonly property string presetLine: {
+    if (store.analyseMode && store.recording)
+      return "Talk as you would on a call, with a pause now and then. " + root.clock(store.recordElapsed) + " / 0:10"
+    if (store.analysing) return "Measuring your test"
+    if (store.analysisError !== "") return store.analysisError
+    var a = store.analysis
+    if (!a) return "Analyse records ten seconds of you talking and fits every preset to your voice, your microphone and your room. Until then they are set for a voice like most."
+    if (!a.sameMic) return "The last test was on another microphone, so the presets are set for a voice like most. Analyse fits them to this one."
+    var d = new Date(a.at * 1000)
+    var when = d.toDateString() === new Date().toDateString() ? "at " + Qt.formatTime(d, "HH:mm") : "of " + Qt.formatDate(d, "d MMMM")
+    var t = "Fitted to your test " + when + ": your voice at " + Math.round(a.speech) + " dB"
+    if (a.noiseSure) t += ", the room at " + Math.round(a.noise) + " dB"
+    if (a.f0 > 0) t += ", your pitch around " + Math.round(a.f0) + " Hz"
+    return t + "."
   }
 
   function clock(seconds) {

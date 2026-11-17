@@ -3,3 +3,4 @@ CurveView 1.0 CurveView.qml
 StepRow 1.0 StepRow.qml
 LineProcess 1.0 LineProcess.qml
 GateView 1.0 GateView.qml
+LevelMeter 1.0 LevelMeter.qml

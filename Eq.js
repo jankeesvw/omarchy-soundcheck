@@ -262,7 +262,7 @@ function responseDb(gains, highpassOn, highpassFreq, freq) {
 }
 
 // A target from a few anchor points ([freq, dB] pairs), smoothly joined in
-// log frequency. Presets are written this way.
+// log frequency. The helper draws the presets' curves the same way.
 function fromAnchors(anchors) {
   var t = new Array(GRID)
   for (var k = 0; k < GRID; k++) {
@@ -283,16 +283,3 @@ function fromAnchors(anchors) {
   return t
 }
 
-var PRESETS = [
-  { id: "flat", label: "Flat", anchors: [[25, 0], [20000, 0]] },
-  // Takes the boxiness out of a dynamic broadcast mic and adds a little air.
-  { id: "clearer", label: "Clearer", anchors: [[25, 0], [120, 0], [280, -3.5], [700, -0.5], [2000, 0], [4200, 3], [8000, 1.5], [14000, 2], [20000, 1]] },
-  { id: "warmer", label: "Warmer", anchors: [[25, 0], [90, 1], [180, 3], [400, 1], [1000, 0], [5000, -1], [10000, -2.5], [20000, -3]] },
-  { id: "less-hiss", label: "Less hiss", anchors: [[25, 0], [3000, 0], [6000, -2], [9000, -6], [14000, -9], [20000, -10]] }
-]
-
-function preset(id) {
-  for (var i = 0; i < PRESETS.length; i++)
-    if (PRESETS[i].id === id) return fromAnchors(PRESETS[i].anchors)
-  return flat()
-}

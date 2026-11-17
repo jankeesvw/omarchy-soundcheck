@@ -2,12 +2,13 @@ import QtQuick
 import qs.Commons
 import qs.Ui
 
-// One step of the chain: a switch, a name, one slider and its value.
+// One step of the chain: a switch, a name, one slider and its value, and for
+// a step that comes in kinds, a row of them under the slider.
 //
 // The whole row is a single stop for the keyboard: Space switches the step,
-// Left and Right move the slider (Shift for bigger steps). A step that needs a
-// package shows the command to install it instead of a slider, and copies it
-// on Enter or a click.
+// Left and Right move the slider (Shift for bigger steps), Up and Down pick
+// the kind. A step that needs a package shows the command to install it
+// instead of a slider, and copies it on Enter or a click.
 Item {
   id: row
 
@@ -27,6 +28,9 @@ Item {
   property string packageName: ""
   property string restartText: "Installed. Restarting the chain adds it (a second of silence on the microphone)."
   property string hint: ""
+  // Kinds, as [{ value, label }], and the one picked.
+  property var choices: []
+  property string choice: ""
 
   // The gate's history strip: the last seconds of the microphone with the
   // threshold across, and what got through in the accent colour.
@@ -44,6 +48,7 @@ Item {
   signal moved(real value)
   signal copyRequested()
   signal restartRequested()
+  signal chose(string value)
 
   activeFocusOnTab: true
   implicitHeight: content.implicitHeight + Style.space(10)
@@ -56,6 +61,15 @@ Item {
   function nudge(direction, big) {
     var v = Math.max(row.minimum, Math.min(row.maximum, row.value + direction * (big ? row.bigStep : row.step)))
     if (v !== row.value) row.moved(v)
+  }
+
+  function pick(direction) {
+    var n = row.choices.length
+    if (n === 0) return
+    var at = 0
+    for (var i = 0; i < n; i++) if (row.choices[i].value === row.choice) at = i
+    var next = Math.max(0, Math.min(n - 1, at + direction))
+    if (next !== at) row.chose(row.choices[next].value)
   }
 
   function activate() {
@@ -72,6 +86,10 @@ Item {
       row.nudge(-1, big); event.accepted = true
     } else if (row.mode === "ready" && event.key === Qt.Key_Right) {
       row.nudge(1, big); event.accepted = true
+    } else if (row.mode === "ready" && row.choices.length > 0 && event.key === Qt.Key_Up) {
+      row.pick(-1); event.accepted = true
+    } else if (row.mode === "ready" && row.choices.length > 0 && event.key === Qt.Key_Down) {
+      row.pick(1); event.accepted = true
     }
   }
 
@@ -167,6 +185,30 @@ Item {
       value: row.value
       opacity: row.checked || !row.toggleable ? 1.0 : 0.45
       onMoved: function(v) { row.forceActiveFocus(); row.moved(v) }
+    }
+
+    // The kinds. Not stops of their own: the row is the stop, Up and Down pick.
+    Row {
+      visible: row.choices.length > 0 && row.mode === "ready"
+      spacing: Style.space(4)
+      opacity: row.checked || !row.toggleable ? 1.0 : 0.45
+
+      Repeater {
+        model: row.choices
+        delegate: Button {
+          required property var modelData
+          text: modelData.label
+          selected: modelData.value === row.choice
+          bordered: true
+          fontFamily: row.fontFamily
+          fontSize: Style.font.caption
+          verticalPadding: Style.space(2)
+          horizontalPadding: Style.space(7)
+          foreground: row.foreground
+          accent: row.accent
+          onClicked: { row.forceActiveFocus(); row.chose(modelData.value) }
+        }
+      }
     }
 
     GateView {

@@ -12,6 +12,7 @@ or one per line for the commands that stream.
   soundcheck mic <node name>             listen to another microphone
   soundcheck meter                       NDJSON: levels and a spectrum, while the panel is open
   soundcheck record                      NDJSON: ten seconds of before and after
+  soundcheck analyse                     measure the test, fit the presets to it
   soundcheck play before|after <sink>    play the last test back
   soundcheck demo on | off               invented devices and curve, for screenshots
 
@@ -38,6 +39,7 @@ import io
 import fcntl
 import json
 import math
+import operator
 import os
 import pwd
 import random
@@ -71,8 +73,8 @@ BANDS = 30
 # Bumped when the shape of the chain changes, so a chain built by an older
 # version is recognised and offered a restart instead of being sent controls
 # it does not have. 2: the noise gate built from parts (see render).
-# 3: distortion and reverb.
-GRAPH_VERSION = 3
+# 3: distortion and reverb. 4: four kinds of distortion, the pitch shifter.
+GRAPH_VERSION = 4
 # The gate is shut 3 dB under its threshold and fully open 3 dB over it.
 GATE_KNEE_DB = 6.0
 # log node: M2 * ln(M1 * x) with x = 10 * level, which makes its output
@@ -81,6 +83,21 @@ GATE_LOG_M2 = 20.0 / (GATE_KNEE_DB * math.log(10.0))
 GATE_LOG_OFFSET = 40.0 / GATE_KNEE_DB
 # Distortion: the slider (0 to 100) is up to this much drive, in dB.
 DRIVE_MAX_DB = 36.0
+# The kinds, in the order of the mixer's inputs. The dry voice comes after them.
+DIST_KINDS = ("warm", "hard", "fuzz", "radio")
+# What each kind needs added after it, in dB, to come out as loud as the dry
+# voice: at a drive of 0, 20, ... 100%, measured on a voice at -30 dBFS (rms).
+# The radio is kept 3 dB under that: a voice squeezed into the telephone band
+# sounds louder than its rms says.
+DIST_LEVEL = {
+    "warm": (0.7, -5.7, -11.4, -16.3, -20.3, -23.2),
+    "hard": (0.0, -7.2, -14.3, -20.3, -24.4, -26.6),
+    "fuzz": (-9.6, -16.6, -21.9, -24.9, -26.7, -27.9),
+    "radio": (3.2, -4.0, -10.9, -16.5, -20.3, -22.7),
+}
+# Pitch: Rubber Band's live shifter, the one built for low latency.
+RUBBERBAND_LIB = "/usr/lib/ladspa/ladspa-rubberband.so"
+PITCH_LABEL = "rubberband-live-pitchshifter-mono"
 # Reverb: the impulse response the convolver plays, written next to the
 # config, and how long the room rings.
 REVERB_FILE = "reverb.wav"
@@ -430,9 +447,12 @@ def default_settings():
         "gate": {"on": True, "threshold": -55.0},
         "compressor": {"on": True, "threshold": -24.0, "ratio": 3.0},
         "limiter": {"on": True, "ceiling": -1.0},
-        "distortion": {"on": False, "drive": 40.0},
+        "distortion": {"on": False, "kind": "warm", "drive": 40.0},
+        "pitch": {"on": False, "semitones": -5},
         "reverb": {"on": False, "amount": 30.0},
         "gain": 0.0,
+        # The preset chosen last, which Analyse fits again; "" for none.
+        "preset": "",
     }
 
 
@@ -474,10 +494,16 @@ def normalise(raw):
     lm = section("limiter")
     s["limiter"] = {"on": onoff(lm, True), "ceiling": round(clamp(finite(lm.get("ceiling"), -1.0), -12.0, 0.0), 1)}
     ds = section("distortion")
-    s["distortion"] = {"on": onoff(ds, False), "drive": round(clamp(finite(ds.get("drive"), 40.0), 0.0, 100.0), 1)}
+    kind = ds.get("kind")
+    s["distortion"] = {"on": onoff(ds, False), "kind": kind if kind in DIST_KINDS else "warm",
+                       "drive": round(clamp(finite(ds.get("drive"), 40.0), 0.0, 100.0), 1)}
+    pt = section("pitch")
+    s["pitch"] = {"on": onoff(pt, False), "semitones": int(round(clamp(finite(pt.get("semitones"), -5), -12, 12)))}
     rv = section("reverb")
     s["reverb"] = {"on": onoff(rv, False), "amount": round(clamp(finite(rv.get("amount"), 30.0), 0.0, 100.0), 1)}
     s["gain"] = round(clamp(finite(raw.get("gain"), 0.0), -12.0, 12.0), 1)
+    preset = raw.get("preset")
+    s["preset"] = preset if preset in PRESET_IDS else ""
     return s
 
 
@@ -529,7 +555,7 @@ def load_state():
     restore = st.get("restoreSource", "")
     v = graph.get("v")
     return {"graph": {"lsp": graph.get("lsp") is True, "rnnoise": graph.get("rnnoise") is True,
-                      "reverb": graph.get("reverb") is True,
+                      "reverb": graph.get("reverb") is True, "pitch": graph.get("pitch") is True,
                       "v": v if isinstance(v, int) and not isinstance(v, bool) else 1},
             "restoreSource": restore if valid_name(restore) and not restore.startswith(NODE_PREFIX) else ""}
 
@@ -556,30 +582,41 @@ def demo_on():
 
 
 def demo_settings():
+    """Podcast, fitted to the demo's test (below), so the screenshots show a
+    preset lit and the curve it drew."""
     s = default_settings()
-    anchors = [(25, 0), (110, 0.5), (260, -4.0), (600, -1.0), (1500, 0.5), (3800, 4.0), (6000, 2.0), (11000, 3.0), (20000, 1.0)]
-    curve = []
-    for k in range(GRID):
-        x = math.log(grid_freq(k))
-        val = anchors[-1][1]
-        for a in range(len(anchors) - 1):
-            x0, x1 = math.log(anchors[a][0]), math.log(anchors[a + 1][0])
-            if x0 <= x <= x1:
-                f = (x - x0) / (x1 - x0)
-                f = f * f * (3 - 2 * f)
-                val = anchors[a][1] + (anchors[a + 1][1] - anchors[a][1]) * f
-                break
-        if x < math.log(anchors[0][0]):
-            val = anchors[0][1]
-        curve.append(round(val, 2))
-    s["curve"] = curve
+    s.update(fit_preset("podcast", demo_analysis(), {"lsp": True}))
+    s["preset"] = "podcast"
     # The band gains are solved from the curve in the panel (Eq.js); nothing
     # plays in demo mode, so they are left flat here.
     s["gains"] = [0.0] * BANDS
     s["mic"] = "alsa_input.usb-Studio_Mic-00.mono-fallback"
     s["monitorSink"] = "alsa_output.pci-0000_00_1f.3.analog-stereo"
-    s["gate"]["threshold"] = -48.0
     return s
+
+
+# A test that went well, in a room with something rumbling in it, made a
+# few minutes before the screenshot: a voice a little boxy around 400 Hz and
+# a little dull around 3 kHz, in a quiet room (see demo_analysis).
+DEMO_ANALYSIS = {
+    "at": 0, "mic": "alsa_input.usb-Studio_Mic-00.mono-fallback",
+    "speech": -27.0, "noise": -68.0, "noiseSure": True, "noiseEnv": -70.0, "lowEnv": -41.0,
+    "spread": [-36.0, -32.5, -30.5, -29.0, -27.5, -26.5, -25.5, -24.5, -23.0, -21.0],
+    "peak": -6.5, "clips": 0, "f0": 115, "rumble": -16.0, "voiceSeconds": 7.2,
+}
+
+
+def demo_analysis():
+    def bump(f, at, db, octaves):
+        return db * math.exp(-(math.log2(f / at) / octaves) ** 2)
+    voice, room = [], []
+    for k in range(GRID):
+        f = grid_freq(k)
+        v = ltass_at(f) - 92 + bump(f, 420, 9.0, 0.6) + bump(f, 3200, -8.0, 0.7)
+        v -= 12 * max(0.0, math.log2(90 / f)) + 18 * max(0.0, math.log2(f / 12000))
+        voice.append(round(clamp(v, -120.0, 0.0), 1))
+        room.append(round(-86.0 - 2 * math.log2(f / 1000), 1))
+    return dict(DEMO_ANALYSIS, at=int(time.time()) - 180, spectrum=voice, noiseSpectrum=room)
 
 
 def demo_status():
@@ -593,9 +630,11 @@ def demo_status():
                  {"name": "alsa_input.usb-Wireless_Receiver-01.analog-stereo", "label": "Wireless Receiver", "channels": 2}],
         "sinks": [{"name": s["monitorSink"], "label": "Headphones", "headphones": True},
                   {"name": "alsa_output.usb-Desk_Speakers-00.analog-stereo", "label": "Desk Speakers", "headphones": False}],
-        "packages": {"lsp": True, "rnnoise": True},
-        "graph": {"lsp": True, "rnnoise": True, "reverb": True, "v": GRAPH_VERSION}, "graphCurrent": True,
+        "packages": {"lsp": True, "rnnoise": True, "reverb": True, "pitch": True, "v": GRAPH_VERSION},
+        "graph": {"lsp": True, "rnnoise": True, "reverb": True, "pitch": True, "v": GRAPH_VERSION}, "graphCurrent": True,
         "recording": {"before": True, "after": True, "seconds": 6.4},
+        "analysis": analysis_view(demo_analysis(), s["mic"]),
+        "presets": preset_fits(demo_analysis(), s["mic"], {"lsp": True}),
         "settings": s,
     }
 
@@ -706,7 +745,16 @@ def unit_active():
 
 def packages():
     return {"lsp": file_exists(os.path.join(LSP_DIR, "compressor_mono.ttl")) and file_exists(os.path.join(LSP_DIR, "limiter_mono.ttl")),
-            "rnnoise": file_exists(RNNOISE_LIB), "reverb": reverb_path() is not None, "v": GRAPH_VERSION}
+            "rnnoise": file_exists(RNNOISE_LIB), "reverb": reverb_path() is not None,
+            "pitch": file_exists(RUBBERBAND_LIB), "v": GRAPH_VERSION}
+
+
+def dist_level(kind, drive):
+    """The level after a kind of distortion at a drive of 0 to 100, in dB."""
+    table = DIST_LEVEL[kind]
+    pos = clamp(drive, 0.0, 100.0) / 100.0 * (len(table) - 1)
+    k = min(int(pos), len(table) - 2)
+    return table[k] + (table[k + 1] - table[k]) * (pos - k)
 
 
 def reverb_path():
@@ -810,6 +858,8 @@ def status():
     current = default_source()
     mic = pick_mic(settings, mics, current)
     label = next((m["label"] for m in mics if m["name"] == mic), "")
+    analysis = load_analysis()
+    graph = packages()
     return {
         "ok": sources is not None,
         "demo": False,
@@ -823,10 +873,12 @@ def status():
         "micPresent": any(m["name"] == mic for m in mics),
         "mics": mics,
         "sinks": list_sinks(sinks),
-        "packages": packages(),
+        "packages": graph,
         "graph": state["graph"],
         "graphCurrent": state["graph"]["v"] == GRAPH_VERSION,
         "recording": recording_info(),
+        "analysis": analysis_view(analysis, mic),
+        "presets": preset_fits(analysis, mic, graph),
         "settings": settings,
     }
 
@@ -880,16 +932,30 @@ def controls(s, graph):
         lm = s["limiter"]
         c["lim:enabled"] = 1.0 if lm["on"] else 0.0
         c["lim:th"] = lin(lm["ceiling"])
+    if graph.get("pitch"):
+        pt = s["pitch"]
+        c["pitch:Semitones"] = float(pt["semitones"])
+        c["p_mix:Gain 1"] = 1.0 if pt["on"] else 0.0
+        c["p_mix:Gain 2"] = 0.0 if pt["on"] else 1.0
     ds = s["distortion"]
     drive = ds["drive"] / 100.0 * DRIVE_MAX_DB
     # Half the drive in each of two stages: one linear node goes to 10 at most.
     c["d_pre:Mult"] = c["d_pre2:Mult"] = 10 ** (drive / 40.0)
-    # Back down by the drive, less what the clipper takes off a voice at a
-    # normal level (measured: about drive^2 / 110 dB), so the slider changes
-    # the grit and not the loudness.
-    c["d_post:Mult"] = 10 ** ((drive * drive / 110.0 - drive) / 20.0)
-    c["d_mix:Gain 1"] = 1.0 if ds["on"] else 0.0
-    c["d_mix:Gain 2"] = 0.0 if ds["on"] else 1.0
+    if graph.get("v", GRAPH_VERSION) >= 4:
+        # Every kind runs all the time; the mixer picks one, at the level that
+        # keeps the voice about as loud as it was, so the slider changes the
+        # grit and not the loudness, and switching kinds is instant.
+        for i, kind in enumerate(DIST_KINDS):
+            picked = ds["on"] and ds["kind"] == kind
+            c[f"d_mix:Gain {i + 1}"] = lin(dist_level(kind, ds["drive"])) if picked else 0.0
+        c[f"d_mix:Gain {len(DIST_KINDS) + 1}"] = 0.0 if ds["on"] else 1.0
+    else:
+        # A chain from version 3: only the warm clipper, then a level, with
+        # the clipped voice on the mixer's first input and the dry one on its
+        # second. Sending it the controls above would mute the dry voice.
+        c["d_post:Mult"] = lin(dist_level("warm", ds["drive"]))
+        c["d_mix:Gain 1"] = 1.0 if ds["on"] else 0.0
+        c["d_mix:Gain 2"] = 0.0 if ds["on"] else 1.0
     if graph.get("reverb"):
         rv = s["reverb"]
         c["rv_mix:Gain 1"] = rv["amount"] / 100.0 * 0.7 if rv["on"] else 0.0
@@ -965,27 +1031,54 @@ def render(s, graph, mic, preview_sink=None):
                      f'{ctl(name, {"Freq": band_freq(i), "Q": band_q(i)})} }}')
         links.append(f'{{ output = "{last}" input = "{name}:In" }}')
         last = f"{name}:Out"
-    # Distortion: a soft clipper, x / (1 + |x|), after the drive and before a
-    # level that keeps the voice about as loud as it was. Off, the mixer
-    # passes the dry voice and nothing of the clipped one.
+    # Pitch: Rubber Band's live shifter, after the curve and before the
+    # distortion, so a lower voice is driven as hard as yours. Off, the mixer
+    # passes the voice around it, without the shifter's latency.
+    if graph.get("pitch"):
+        nodes.append('{ type = builtin name = pin label = copy }')
+        nodes.append(f'{{ type = ladspa name = pitch plugin = "ladspa-rubberband" label = {PITCH_LABEL} '
+                     f'{ctl("pitch", {"Cents": 0, "Octaves": 0, "Formant Preserving": 0, "Wet-Dry Mix": 0})} }}')
+        nodes.append(f'{{ type = builtin name = p_mix label = mixer {ctl("p_mix")} }}')
+        links += [f'{{ output = "{last}" input = "pin:In" }}', '{ output = "pin:Out" input = "pitch:Input" }',
+                  '{ output = "pitch:Output" input = "p_mix:In 1" }', '{ output = "pin:Out" input = "p_mix:In 2" }']
+        last = "p_mix:Out"
+    # Distortion: the voice driven up (d_pre, d_pre2), then four clippers side
+    # by side, and a mixer that passes one of them or the dry voice.
+    #   warm:  x / (1 + |x|), a soft knee, mostly odd harmonics.
+    #   hard:  cut flat at full scale, buzzy.
+    #   fuzz:  three times as hot and pushed off centre before it is cut, so
+    #          the two halves of the wave clip differently (even harmonics,
+    #          and a sputter on quiet words); the offset is filtered out after.
+    #   radio: the telephone band (400 Hz to 3 kHz), clipped, then dulled.
     for name, label, fixed in (
         ("din", "copy", {}),
         ("d_pre", "linear", {"Add": 0.0}),
         ("d_pre2", "linear", {"Add": 0.0}),
-        ("d_abs", "abs", {}),
-        ("d_one", "linear", {"Mult": 1.0, "Add": 1.0}),
-        ("d_rec", "recip", {}),
-        ("d_clip", "mult", {}),
-        ("d_post", "linear", {"Add": 0.0}),
+        ("w_abs", "abs", {}),
+        ("w_one", "linear", {"Mult": 1.0, "Add": 1.0}),
+        ("w_rec", "recip", {}),
+        ("w_clip", "mult", {}),
+        ("h_clip", "clamp", {"Min": -1.0, "Max": 1.0}),
+        ("f_bias", "linear", {"Mult": 3.0, "Add": 0.5}),
+        ("f_clip", "clamp", {"Min": -1.0, "Max": 1.0}),
+        ("f_dc", "bq_highpass", {"Freq": 30.0, "Q": 0.707}),
+        ("r_hp", "bq_highpass", {"Freq": 400.0, "Q": 0.707}),
+        ("r_lp", "bq_lowpass", {"Freq": 3000.0, "Q": 0.707}),
+        ("r_clip", "clamp", {"Min": -0.5, "Max": 0.5}),
+        ("r_lp2", "bq_lowpass", {"Freq": 3500.0, "Q": 0.707}),
         ("d_mix", "mixer", {}),
     ):
         nodes.append(f'{{ type = builtin name = {name} label = {label} {ctl(name, fixed)} }}')
     links.append(f'{{ output = "{last}" input = "din:In" }}')
-    for src, dst in (("din", "d_pre"), ("d_pre", "d_pre2"), ("d_pre2", "d_abs"), ("d_abs", "d_one"),
-                     ("d_one", "d_rec"), ("d_clip", "d_post")):
+    for src, dst in (("din", "d_pre"), ("d_pre", "d_pre2"),
+                     ("d_pre2", "w_abs"), ("w_abs", "w_one"), ("w_one", "w_rec"),
+                     ("d_pre2", "h_clip"),
+                     ("d_pre2", "f_bias"), ("f_bias", "f_clip"), ("f_clip", "f_dc"),
+                     ("d_pre2", "r_hp"), ("r_hp", "r_lp"), ("r_lp", "r_clip"), ("r_clip", "r_lp2")):
         links.append(f'{{ output = "{src}:Out" input = "{dst}:In" }}')
-    links += ['{ output = "d_pre2:Out" input = "d_clip:In 1" }', '{ output = "d_rec:Out" input = "d_clip:In 2" }',
-              '{ output = "d_post:Out" input = "d_mix:In 1" }', '{ output = "din:Out" input = "d_mix:In 2" }']
+    links += ['{ output = "d_pre2:Out" input = "w_clip:In 1" }', '{ output = "w_rec:Out" input = "w_clip:In 2" }']
+    for i, src in enumerate(("w_clip", "h_clip", "f_dc", "r_lp2", "din")):
+        links.append(f'{{ output = "{src}:Out" input = "d_mix:In {i + 1}" }}')
     last = "d_mix:Out"
     if graph.get("lsp"):
         nodes.append(f'{{ type = lv2 name = comp plugin = "{LSP_COMPRESSOR}" '
@@ -1046,7 +1139,7 @@ def render(s, graph, mic, preview_sink=None):
             }}"""
     return f"""# Written by the Soundcheck plugin ({PLUGIN_ID}); rewritten on every change.
 # Run as its own PipeWire client: pipewire -c <this file>
-# soundcheck-graph: lsp={int(bool(graph.get("lsp")))} rnnoise={int(bool(graph.get("rnnoise")))}
+# soundcheck-graph: lsp={int(bool(graph.get("lsp")))} rnnoise={int(bool(graph.get("rnnoise")))} pitch={int(bool(graph.get("pitch")))} v={GRAPH_VERSION}
 
 context.properties = {{
     log.level = 0
@@ -1117,6 +1210,11 @@ def conf_path():
 
 
 def write_conf(settings, graph, mic):
+    # A chain an older version built keeps its own config until it is
+    # restarted: this version would write another shape of graph, which the
+    # state (and so every live control) would then no longer describe.
+    if graph.get("v") != GRAPH_VERSION:
+        return
     fd = config_dir()
     try:
         if graph.get("reverb"):
@@ -1477,8 +1575,10 @@ def level_db(samples):
         return -120.0, -120.0
     peak = max(abs(min(samples)), abs(max(samples)))
     rms = math.sqrt(sum(x * x for x in samples) / len(samples))
+    # The peak may go over full scale: the chain runs in floating point, and
+    # what is over 0 dB clips the moment an app turns it into integers.
     return (round(clamp(20 * math.log10(rms + 1e-9), -120.0, 0.0), 1),
-            round(clamp(20 * math.log10(peak + 1e-9), -120.0, 0.0), 1))
+            round(clamp(20 * math.log10(peak + 1e-9), -120.0, 12.0), 1))
 
 
 def record_argv(target, fmt, node_name, latency="20ms"):
@@ -1566,8 +1666,7 @@ def cmd_meter(tap=""):
                 for key in procs:
                     rms, peak = level_db(recent[key])
                     msg[key] = rms
-                    if key == "in":
-                        msg["inPeak"] = peak
+                    msg[key + "Peak"] = peak
                     del recent[key][:]
                 emit(msg)
             if now >= next_spec:
@@ -1604,7 +1703,8 @@ def demo_meter():
             f = grid_freq(k)
             hp = 40 * math.log10(f / 80) if f < 80 else 0.0
             out.append(round(clamp(bands[k] + curve[k] + hp + 2, -120, 0), 1) if gate_open else -120.0)
-        emit({"type": "level", "in": round(lvl, 1), "inPeak": round(lvl + 9, 1), "out": round(lvl + 3, 1) if gate_open else -120.0})
+        emit({"type": "level", "in": round(lvl, 1), "inPeak": round(lvl + 9, 1),
+              "out": round(lvl + 3, 1) if gate_open else -120.0, "outPeak": round(lvl + 11, 1) if gate_open else -120.0})
         analyzer.update({"in": bands, "out": out}, t, 0.05)
         emit(analyzer.message())
         time.sleep(0.05)
@@ -1612,6 +1712,523 @@ def demo_meter():
 
 
 # ---------------------------------------------------------- recording
+
+# ------------------------------------------------------------ analysis
+#
+# What a test recording says about your voice, your microphone and your room,
+# and the presets fitted to that. A gate or a compressor set in plain dB is
+# right for one microphone at one input volume only, so the presets carry no
+# levels of their own: they are worked out from the measurement (fit_preset).
+#
+# Everything is measured on the bare microphone (before.wav), the way the
+# chain's own steps hear it: after the high-pass, the gate's level as the
+# smoothed rectified signal, the compressor's as the rms.
+
+ANALYSIS_FILE = "analysis.json"
+ANALYSIS_VERSION = 1
+FRAME = RATE // 100              # levels are measured over 10 ms
+MIN_VOICE_S = 2.0                # with less voice than this nothing is measured
+# The average voice: the long-term spectrum of speech in third octaves, men
+# and women together, after Byrne et al. (1994), rounded. Yours is compared
+# with its shape, never its level.
+LTASS = ((63, 39), (80, 44), (100, 54), (125, 58), (160, 57), (200, 60), (250, 60), (315, 59),
+         (400, 62), (500, 62), (630, 61), (800, 57), (1000, 54), (1250, 53), (1600, 52),
+         (2000, 49), (2500, 48), (3150, 47), (4000, 46), (5000, 45), (6300, 44), (8000, 44),
+         (10000, 43), (12500, 41), (16000, 41))
+
+# What each preset is for, as a way of treating the voice:
+#   target    how loud the voice leaves the chain, in dB rms while you talk
+#   below     the compressor's threshold, this far under your voice
+#   ratio     the compressor's ratio
+#   denoise   added to the noise removal the room asks for
+#   highpass  lowest and highest, and where it goes when no voice was measured
+#   match     how much of the difference with the average voice the curve evens out
+#   flavour   the preset's own curve on top of that, as (Hz, dB) anchors
+PRESETS = (
+    ("natural", {"label": "Natural", "target": -20.0, "below": 3.0, "ratio": 2.0, "denoise": -15.0,
+                 "highpass": (60.0, 90.0, 70.0), "match": 0.35,
+                 "flavour": ((25, 0.0), (20000, 0.0))}),
+    ("call", {"label": "Call", "target": -20.0, "below": 6.0, "ratio": 2.5, "denoise": 10.0,
+              "highpass": (100.0, 140.0, 100.0), "match": 0.5,
+              "flavour": ((25, 0.0), (180, 0.0), (300, -1.5), (800, 0.0), (2000, 1.0), (3500, 2.5),
+                          (6000, 1.0), (9000, 0.0), (20000, -1.0))}),
+    ("podcast", {"label": "Podcast", "target": -18.0, "below": 8.0, "ratio": 3.0, "denoise": 0.0,
+                 "highpass": (65.0, 100.0, 80.0), "match": 0.5,
+                 "flavour": ((25, 0.0), (90, 0.5), (150, 1.0), (300, -2.5), (700, -0.5), (2000, 0.0),
+                             (4500, 2.0), (8000, 1.0), (12000, 1.5), (20000, 1.0))}),
+    ("stream", {"label": "Stream", "target": -16.0, "below": 10.0, "ratio": 4.0, "denoise": 5.0,
+                "highpass": (65.0, 100.0, 80.0), "match": 0.6,
+                "flavour": ((25, 0.0), (80, 1.0), (140, 1.5), (350, -2.5), (900, 0.0), (3000, 2.5),
+                            (5000, 2.0), (10000, 2.5), (20000, 1.5))}),
+)
+FITTED_IDS = tuple(pid for pid, _ in PRESETS)
+# Clean comes first: every step and every effect off, the curve flat, the
+# volume at 0. Only the switches go: the sliders stay where they were, so a
+# step switched back on comes back the way you had it.
+CLEAN = "clean"
+PRESET_IDS = (CLEAN,) + FITTED_IDS
+# Before any test: a voice, a microphone and a room like most.
+TYPICAL = {"speech": -30.0, "noise": -66.0, "noiseEnv": -68.0, "lowEnv": -44.0, "noiseSure": True,
+           "spread": [-38.5, -35.5, -33.5, -32.0, -30.5, -29.5, -28.5, -27.5, -26.5, -25.0],
+           "f0": 0, "rumble": -40.0, "spectrum": None, "noiseSpectrum": None}
+
+
+def percentile(values, p):
+    s = sorted(values)
+    if not s:
+        return -120.0
+    return s[min(len(s) - 1, max(0, int(round(p / 100.0 * (len(s) - 1)))))]
+
+
+def power_mean(dbs):
+    return 10 * math.log10(sum(10 ** (d / 10) for d in dbs) / len(dbs)) if dbs else -120.0
+
+
+def biquad(x, kind, freq, rate=RATE, q=0.707):
+    """x through one RBJ filter: the same one as PipeWire's bq_ nodes."""
+    w0 = 2 * math.pi * freq / rate
+    cw, alpha = math.cos(w0), math.sin(w0) / (2 * q)
+    b0, b1 = ((1 + cw) / 2, -(1 + cw)) if kind == "highpass" else ((1 - cw) / 2, 1 - cw)
+    a0 = 1 + alpha
+    b0, b1, b2, a1, a2 = b0 / a0, b1 / a0, b0 / a0, -2 * cw / a0, (1 - alpha) / a0
+    out = [0.0] * len(x)
+    x1 = x2 = y1 = y2 = 0.0
+    for i, v in enumerate(x):
+        y = b0 * v + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        x2, x1, y2, y1 = x1, v, y1, y
+        out[i] = y
+    return out
+
+
+def anchors_curve(anchors):
+    """A curve on the grid through a few (Hz, dB) points, joined smoothly in
+    log frequency: Eq.js's fromAnchors, so a preset draws the same here."""
+    curve = []
+    for k in range(GRID):
+        x = math.log(grid_freq(k))
+        val = anchors[-1][1] if x >= math.log(anchors[-1][0]) else anchors[0][1]
+        for (f0, d0), (f1, d1) in zip(anchors, anchors[1:]):
+            x0, x1 = math.log(f0), math.log(f1)
+            if x0 <= x <= x1:
+                t = (x - x0) / (x1 - x0)
+                val = d0 + (d1 - d0) * t * t * (3 - 2 * t)
+                break
+        curve.append(round(val, 2))
+    return curve
+
+
+def ltass_at(freq):
+    if freq <= LTASS[0][0]:
+        return float(LTASS[0][1])
+    for (f0, d0), (f1, d1) in zip(LTASS, LTASS[1:]):
+        if freq <= f1:
+            return d0 + (d1 - d0) * math.log(freq / f0) / math.log(f1 / f0)
+    return float(LTASS[-1][1])
+
+
+def voice_pitch(raw, starts):
+    """The voice's fundamental in Hz, from the autocorrelation of its loudest
+    moments, or 0 when it is not clear enough to say."""
+    # A twelfth of a millisecond is plenty for 70 to 400 Hz, and the low-pass
+    # keeps the formants from being taken for the pitch.
+    rate = RATE // 4
+    found = []
+    for s in starts:
+        seg = raw[s:s + 4 * (480 + 172)]
+        dec = biquad([sum(seg[i:i + 4]) / 4 for i in range(0, len(seg) - 3, 4)], "lowpass", 900.0, rate)
+        if len(dec) < 480 + 172:
+            continue
+        a = dec[:480]
+        ea = sum(map(operator.mul, a, a))
+        if ea <= 0:
+            continue
+        rs = {}
+        for lag in range(30, 173):
+            b = dec[lag:lag + 480]
+            rs[lag] = sum(map(operator.mul, a, b)) / math.sqrt(ea * sum(map(operator.mul, b, b)) + 1e-18)
+        best = max(rs.values())
+        if best < 0.5:
+            continue
+        # The first strong peak: a period of two is as strong as one.
+        for lag in range(31, 172):
+            if rs[lag] >= 0.85 * best and rs[lag] >= rs[lag - 1] and rs[lag] >= rs[lag + 1]:
+                found.append(rate / lag)
+                break
+    return round(percentile(found, 50)) if len(found) >= 5 else 0
+
+
+def analyse(pcm, mic=""):
+    """Measure a test recording, given as signed 16-bit samples. A dict to
+    keep, or one with "error" when it holds too little voice to go on."""
+    n = len(pcm) // FRAME * FRAME
+    if n < RATE * 3:
+        return {"error": "The test is too short to measure: let it run for the whole ten seconds."}
+    peak = max(max(pcm[:n]), -min(pcm[:n]))
+    # A clip is a flat top: three samples or more in a row at full scale.
+    hot = [i for i, v in enumerate(pcm[:n]) if v >= 32700 or v <= -32700]
+    clips, run_len, last = 0, 0, -10
+    for i in hot:
+        run_len = run_len + 1 if i == last + 1 else 1
+        if run_len == 3:
+            clips += 1
+        last = i
+    raw = [v / 32768.0 for v in pcm[:n]]
+    x = biquad(raw, "highpass", 80.0)
+    levels, envs = [], []
+    for i in range(0, n, FRAME):
+        f = x[i:i + FRAME]
+        levels.append(10 * math.log10(sum(map(operator.mul, f, f)) / FRAME + 1e-14))
+        envs.append(20 * math.log10(sum(map(abs, f)) / FRAME + 1e-9))
+    live = [k for k, d in enumerate(levels) if d > -100]
+    if len(live) < len(levels) / 2:
+        return {"error": "The microphone sent silence: is it muted?"}
+
+    lv = [levels[k] for k in live]
+    noise = percentile(lv, 5)
+    # The active level, roughly as ITU-T P.56 has it: the mean over the moments
+    # louder than 15.9 dB under that mean, so pauses do not pull it down.
+    active = power_mean(lv)
+    for _ in range(30):
+        voiced = [d for d in lv if d > max(active - 15.9, noise + 6.0)]
+        if not voiced:
+            break
+        nxt = power_mean(voiced)
+        if abs(nxt - active) < 0.05:
+            active = nxt
+            break
+        active = nxt
+    floor = max(active - 15.9, noise + 6.0)
+    voiced = [k for k in live if levels[k] > floor]
+    if len(voiced) / 100.0 < MIN_VOICE_S or active - noise < 10:
+        return {"error": "There is too little voice in the test to measure: talk for most of the ten seconds."}
+
+    # The room: the pauses, at least 150 ms of quiet in a row. Without them
+    # the quietest moments are soft words, and the room is a guess.
+    quiet, stretch = [], []
+    for k in live + [-1]:
+        if k >= 0 and levels[k] < noise + 4 and (not stretch or stretch[-1] == k - 1):
+            stretch.append(k)
+            continue
+        if len(stretch) >= 15:
+            quiet += stretch
+        stretch = [k] if k >= 0 and levels[k] < noise + 4 else []
+    noise_sure = bool(quiet)
+    if quiet:
+        noise = power_mean([levels[k] for k in quiet])
+        noise_env = sum(envs[k] for k in quiet) / len(quiet)
+    else:
+        noise_env = percentile([envs[k] for k in live], 5)
+    low_env = percentile([envs[k] for k in voiced], 10)
+    spread = [percentile([levels[k] for k in voiced], p) for p in range(5, 100, 10)]
+
+    # The spectrum of the voice, and of the room, in FFT_N blocks.
+    blocks = []
+    for i in range(0, n - FFT_N + 1, FFT_N):
+        seg = raw[i:i + FFT_N]
+        blocks.append((10 * math.log10(sum(map(operator.mul, seg, seg)) / FFT_N + 1e-14), i))
+    loud = [i for d, i in blocks if d > active - 10]
+    loud = loud[::max(1, len(loud) // 40)]
+    hushed = [i for d, i in sorted(blocks)[:max(1, min(6, len(blocks) // 8))]]
+
+    def average(starts):
+        total = [0.0] * (FFT_N // 2)
+        for s in starts:
+            total = list(map(operator.add, total, fft_power(raw[s:s + FFT_N])))
+        return [p / max(1, len(starts)) for p in total]
+
+    voice_power = average(loud)
+    width = RATE / FFT_N
+    low = sum(voice_power[b] for b in range(1, FFT_N // 2) if b * width <= 70)
+    mid = sum(voice_power[b] for b in range(1, FFT_N // 2) if 150 <= b * width <= 4000)
+
+    order = sorted(voiced, key=lambda k: levels[k], reverse=True)[:max(1, len(voiced) // 4)]
+    starts = sorted(k * FRAME for k in order)[::max(1, len(order) // 30)]
+
+    return {
+        "v": ANALYSIS_VERSION, "at": int(time.time()), "mic": mic if valid_name(mic) else "",
+        "seconds": round(n / RATE, 1), "voiceSeconds": round(len(voiced) / 100.0, 1),
+        "speech": round(active, 1), "noise": round(noise, 1), "noiseSure": noise_sure,
+        "noiseEnv": round(noise_env, 1), "lowEnv": round(low_env, 1),
+        "spread": [round(d, 1) for d in spread],
+        "peak": round(20 * math.log10(max(1, peak) / 32768.0), 1), "clips": clips,
+        "f0": voice_pitch(raw, starts),
+        "rumble": round(clamp(10 * math.log10((low + 1e-14) / (mid + 1e-14)), -90.0, 30.0), 1),
+        "spectrum": band_levels(voice_power), "noiseSpectrum": band_levels(average(hushed)),
+    }
+
+
+def load_analysis():
+    """The last analysis, checked number by number: a hand-edited or planted
+    file gets no say over the settings."""
+    an = load_json(ANALYSIS_FILE, None)
+    if not isinstance(an, dict) or an.get("v") != ANALYSIS_VERSION:
+        return None
+
+    def number(key, lo, hi):
+        v = an.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError(key)
+        return clamp(float(v), lo, hi)
+
+    def bands(key):
+        v = an.get(key)
+        if not isinstance(v, list) or len(v) != GRID:
+            raise ValueError(key)
+        return [round(clamp(finite(d, -120.0), -120.0, 0.0), 1) for d in v]
+
+    try:
+        spread = an.get("spread")
+        if not isinstance(spread, list) or len(spread) != 10:
+            raise ValueError("spread")
+        mic = an.get("mic", "")
+        return {
+            "at": int(number("at", 0, 2 ** 40)), "mic": mic if valid_name(mic) else "",
+            "speech": number("speech", -120, 0), "noise": number("noise", -120, 0),
+            "noiseSure": an.get("noiseSure") is True,
+            "noiseEnv": number("noiseEnv", -120, 0), "lowEnv": number("lowEnv", -120, 0),
+            "spread": [round(clamp(finite(d, -120.0), -120.0, 0.0), 1) for d in spread],
+            "peak": number("peak", -120, 0), "clips": int(number("clips", 0, 1e6)),
+            "f0": int(number("f0", 0, 1000)), "rumble": number("rumble", -90, 30),
+            "voiceSeconds": number("voiceSeconds", 0, 60),
+            "spectrum": bands("spectrum"), "noiseSpectrum": bands("noiseSpectrum"),
+        }
+    except ValueError:
+        return None
+
+
+def octave_smooth(values):
+    """Each point averaged with its neighbours over an octave. Ten seconds of
+    vowels say something about one word, not about the microphone, at any
+    narrower scale; and a curve with steps in it rings."""
+    out = []
+    for k in range(GRID):
+        num_ = den = 0.0
+        for j in range(-3, 4):
+            if 0 <= k + j < GRID:
+                num_ += (4 - abs(j)) * values[k + j]
+                den += 4 - abs(j)
+        out.append(num_ / den)
+    return out
+
+
+def lift_room(m):
+    """Per point, how much of a lift may go there: none where the room is
+    within 6 dB of the voice, all of it from 12 dB apart. A lift where the
+    room is nearly as loud as the voice lifts the room."""
+    sp, nz = m["spectrum"], m["noiseSpectrum"]
+    return [clamp((d - 6.0) / 6.0, 0.0, 1.0) for d in octave_smooth([sp[k] - nz[k] for k in range(GRID)])]
+
+
+def matching_curve(m, strength):
+    """Part of the way from your voice's spectrum to the average one: what
+    the microphone and the room add, evened out."""
+    sp = m["spectrum"]
+    freqs = [grid_freq(k) for k in range(GRID)]
+    diff = [sp[k] - ltass_at(freqs[k]) for k in range(GRID)]
+    mid = [diff[k] for k in range(GRID) if 200 <= freqs[k] <= 4000]
+    off = sum(mid) / len(mid)
+    smooth = octave_smooth([d - off for d in diff])
+    room = lift_room(m)
+    # Your own pitch and its first overtone are yours, not the microphone's:
+    # a deep voice has its weight there, and the average voice is half women.
+    # The correction starts above them, and stops where a voice has little left.
+    base = 1.5 * m["f0"] if m.get("f0") else 150.0
+    out = []
+    for k, f in enumerate(freqs):
+        v = -strength * smooth[k]
+        v = clamp(math.copysign(max(0.0, abs(v) - 1.0), v), -6.0, 4.0)
+        if v > 0:
+            v *= room[k]
+        fade = clamp(math.log(f / base) / math.log(5 / 3.0), 0.0, 1.0) * \
+            clamp(math.log(14000.0 / f) / math.log(14000 / 10000.0), 0.0, 1.0)
+        out.append(v * fade)
+    return out
+
+
+def preset_curve(p, m):
+    flavour = anchors_curve(p["flavour"])
+    measured = bool(m.get("spectrum") and m.get("noiseSpectrum"))
+    fix = matching_curve(m, p["match"]) if measured else [0.0] * GRID
+    room = lift_room(m) if measured else [1.0] * GRID
+    return [round(clamp((v * room[k] if v > 0 else v) + fix[k], -12.0, 12.0), 1) for k, v in enumerate(flavour)]
+
+
+def curve_level(curve, m):
+    """How much louder the curve makes the voice, weighted by where the
+    voice has its energy."""
+    sp = m.get("spectrum")
+    num_ = den = 0.0
+    for k in range(GRID):
+        f = grid_freq(k)
+        if not 100 <= f <= 8000:
+            continue
+        w = 10 ** ((sp[k] if sp else ltass_at(f)) / 10)
+        num_ += w * 10 ** (curve[k] / 10)
+        den += w
+    return 10 * math.log10(num_ / den) if den else 0.0
+
+
+def fit_preset(pid, m, graph):
+    """A preset's settings for this voice, microphone and room (m, from
+    analyse, or TYPICAL): the steps of the Sound section and the curve."""
+    p = dict(PRESETS)[pid]
+    m = m or TYPICAL
+    snr = m["speech"] - m["noise"]
+    lo, hi, unmeasured = p["highpass"]
+    # Under the voice: at 0.6 times its fundamental the high-pass takes a
+    # decibel off it. Rumble sends it as high as the preset goes.
+    hp = 0.6 * m["f0"] if m.get("f0") else unmeasured
+    if m.get("rumble", -90.0) > -20:
+        hp = hi
+    hp = clamp(round(hp / 5) * 5, lo, hi)
+
+    # Noise removal: how readily it silences what is not a voice. The worse
+    # the room, the more.
+    amount = clamp(round((30 + (50 - snr) * 1.8 + p["denoise"]) / 5) * 5, 10, 90)
+
+    # The gate: shut on the room, open on your softest words, both measured
+    # the way the gate itself measures. When they overlap, the words win and
+    # noise removal handles the room.
+    ne, le = m["noiseEnv"], m["lowEnv"]
+    thr = min(max(ne + 0.4 * (le - ne), ne + 5), le - 6)
+
+    curve = preset_curve(p, m)
+    tilt = curve_level(curve, m)
+    threshold = clamp(round(m["speech"] + tilt - p["below"]), -50, 0)
+    ratio = p["ratio"]
+    spread = [d + tilt for d in m["spread"]]
+    if graph.get("lsp"):
+        makeup = min(18.0, -threshold * (1 - 1 / ratio) / 2)
+        out = power_mean([d if d <= threshold else threshold + (d - threshold) / ratio for d in spread]) + makeup
+    else:
+        out = power_mean(spread)
+    natural_quiet = pid == "natural" and snr >= 40
+
+    s = default_settings()
+    s.update({
+        "highpass": {"on": True, "freq": hp},
+        "denoise": {"on": not (pid == "natural" and snr >= 45), "amount": amount},
+        "gate": {"on": not natural_quiet, "threshold": round(thr)},
+        "compressor": {"on": True, "threshold": threshold, "ratio": ratio},
+        "limiter": {"on": True, "ceiling": -1.0},
+        "gain": round((p["target"] - out) * 2) / 2,
+        "curve": curve,
+    })
+    s = normalise(s)
+    return {key: s[key] for key in ("highpass", "denoise", "gate", "compressor", "limiter", "gain", "curve")}
+
+
+def describe_freq(f):
+    if f < 1000:
+        return f"{int(round(f / 10.0) * 10)} Hz"
+    return f"{round(f / 1000.0, 1):g} kHz"
+
+
+def findings(m):
+    """What the analysis found that is worth knowing, most pressing first:
+    a list of {"text", "urgent"}. Plain sentences: the panel shows them as
+    they are."""
+    out = []
+    snr = m["speech"] - m["noise"]
+    if m["clips"]:
+        out.append({"text": f"The microphone clipped {m['clips']} {'time' if m['clips'] == 1 else 'times'}: turn its "
+                            "input volume down and test again. Nothing after it can repair that.", "urgent": True})
+    elif m["peak"] > -1.0:
+        out.append({"text": "Your loudest moments touch the top: a little less input volume leaves room.", "urgent": False})
+    if m["speech"] < -42:
+        out.append({"text": f"Your voice comes in quiet ({round(m['speech'])} dB): turn the microphone's input volume up, "
+                            "or the room gets turned up along with you.", "urgent": True})
+    if not m["noiseSure"]:
+        out.append({"text": "There was no pause in the test to measure the room by: leave a second of quiet now and then.",
+                    "urgent": False})
+    elif snr < 20:
+        out.append({"text": f"The room is nearly as loud as your voice ({round(snr)} dB apart): get closer to the "
+                            "microphone. Noise removal is set high.", "urgent": True})
+    elif snr < 30:
+        out.append({"text": f"A noisy room ({round(snr)} dB under your voice): noise removal is set higher.", "urgent": False})
+    if m["rumble"] > -20:
+        out.append({"text": "Rumble under 70 Hz, from a desk, a fan or traffic: the high-pass goes up.", "urgent": False})
+    if m.get("spectrum") and m.get("noiseSpectrum"):
+        fix = matching_curve(m, 0.5)
+        words = []
+        cut = min(range(GRID), key=lambda k: fix[k])
+        if fix[cut] <= -2.0:
+            f = grid_freq(cut)
+            kind = ("boomy" if f < 300 else "boxy" if f < 800 else "honky" if f < 2000
+                    else "harsh" if f < 5000 else "sharp on the s")
+            words.append(f"{kind} around {describe_freq(f)}")
+        lift = max(range(GRID), key=lambda k: fix[k])
+        if fix[lift] >= 2.0:
+            f = grid_freq(lift)
+            kind = "thin" if f < 400 else "hollow" if f < 1500 else "muffled"
+            words.append(f"{kind} around {describe_freq(f)}")
+        if words:
+            text = " and ".join(words)
+            out.append({"text": f"Compared with an average voice, {text}: every preset's curve evens that out a little.",
+                        "urgent": False})
+    return out
+
+
+def analysis_view(an, mic):
+    """What the panel shows of the last analysis."""
+    if not an:
+        return None
+    return {"at": an["at"], "sameMic": an["mic"] == mic, "speech": round(an["speech"]), "noise": round(an["noise"]),
+            "noiseSure": an["noiseSure"], "f0": an["f0"], "findings": findings(an)}
+
+
+def clean_settings():
+    off = {key: {"on": False} for key in ("highpass", "denoise", "gate", "compressor", "limiter",
+                                         "distortion", "pitch", "reverb")}
+    return dict(off, gain=0.0, curve=[0.0] * GRID)
+
+
+def preset_fits(an, mic, graph):
+    """Every preset as the panel applies it. "fitted" says whether Analyse
+    has anything to fit: Clean is the same for every voice."""
+    use = an if an and an["mic"] == mic else None
+    return ([{"id": CLEAN, "label": "Clean", "fitted": False, "settings": clean_settings()}]
+            + [{"id": pid, "label": p["label"], "fitted": True, "settings": fit_preset(pid, use, graph)}
+               for pid, p in PRESETS])
+
+
+def read_recording(dirfd):
+    """The test recording's samples (mono, s16, RATE), as bytes."""
+    fd = open_regular(dirfd, "before.wav", RECORD_BYTES + 4096)
+    if fd is None:
+        fail("record a test first")
+    try:
+        with wave.open(os.fdopen(fd, "rb"), "rb") as w:
+            if w.getnchannels() != 1 or w.getsampwidth() != 2 or w.getframerate() != RATE:
+                fail("the test recording is not one this plugin wrote")
+            return w.readframes(RECORD_BYTES // 2)
+    except (wave.Error, EOFError):
+        fail("the test recording is damaged")
+
+
+def cmd_analyse():
+    if demo_on():
+        an = demo_analysis()
+        emit({"ok": True, "analysis": analysis_view(an, an["mic"]), "presets": preset_fits(an, an["mic"], {"lsp": True})})
+        return
+    settings = load_settings()
+    mic = pick_mic(settings, list_mics(pactl_json("sources")), default_source())
+    dirfd = runtime_dir()
+    try:
+        frames = read_recording(dirfd)
+    finally:
+        os.close(dirfd)
+    pcm = array.array("h")
+    pcm.frombytes(frames[:len(frames) - len(frames) % 2])
+    if sys.byteorder != "little":
+        pcm.byteswap()
+    result = analyse(pcm, mic)
+    if "error" in result:
+        fail(result["error"])
+    store_json(ANALYSIS_FILE, result)
+    an = load_analysis()
+    emit({"ok": True, "analysis": analysis_view(an, mic), "presets": preset_fits(an, mic, packages())})
+
 
 def cmd_record():
     stop = {"now": False}
@@ -1730,16 +2347,7 @@ def cmd_play(which, sink):
     dirfd = runtime_dir()
     player = preview = None
     try:
-        fd = open_regular(dirfd, "before.wav", RECORD_BYTES + 4096)
-        if fd is None:
-            fail("record a test first")
-        try:
-            with wave.open(os.fdopen(fd, "rb"), "rb") as w:
-                if w.getnchannels() != 1 or w.getsampwidth() != 2 or w.getframerate() != RATE:
-                    fail("the test recording is not one this plugin wrote")
-                frames = w.readframes(RECORD_BYTES // 2)
-        except (wave.Error, EOFError):
-            fail("the test recording is damaged")
+        frames = read_recording(dirfd)
         if len(frames) < RATE // 5:
             fail("the test recording is too short")
         length = len(frames) / (RATE * 2)
@@ -1814,6 +2422,8 @@ def main(argv):
             cmd_meter(argv[2] if len(argv) == 3 else "")
         elif cmd == "record":
             cmd_record()
+        elif cmd == "analyse":
+            cmd_analyse()
         elif cmd == "play" and len(argv) == 4:
             cmd_play(argv[2], argv[3])
         elif cmd == "demo" and len(argv) == 3:

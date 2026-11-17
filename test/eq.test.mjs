@@ -37,11 +37,19 @@ function worstError(target, gains) {
 const flatGains = Eq.solve(Eq.flat())
 check("flat target gives flat bands", flatGains.every(g => g === 0))
 
-for (const p of Eq.PRESETS) {
-  const t = Eq.preset(p.id)
+// Curves of the kind people use: less box and more presence, warmth, less
+// hiss, and the shape the Stream preset starts from.
+const shapes = {
+  clearer: [[25, 0], [120, 0], [280, -3.5], [700, -0.5], [2000, 0], [4200, 3], [8000, 1.5], [14000, 2], [20000, 1]],
+  warmer: [[25, 0], [90, 1], [180, 3], [400, 1], [1000, 0], [5000, -1], [10000, -2.5], [20000, -3]],
+  "less hiss": [[25, 0], [3000, 0], [6000, -2], [9000, -6], [14000, -9], [20000, -10]],
+  stream: [[25, 0], [80, 1], [140, 1.5], [350, -2.5], [900, 0], [3000, 2.5], [5000, 2], [10000, 2.5], [20000, 1.5]],
+}
+for (const [name, anchors] of Object.entries(shapes)) {
+  const t = Eq.fromAnchors(anchors)
   const g = Eq.solve(t)
   const err = worstError(t, g)
-  check(`preset ${p.id} within 1 dB`, err < 1.0, `worst ${err.toFixed(2)} dB`)
+  check(`a ${name} curve within 1 dB`, err < 1.0, `worst ${err.toFixed(2)} dB`)
 }
 
 let bump = Eq.flat()
@@ -63,7 +71,7 @@ const junk = Eq.solve([NaN, Infinity, "x", null, 1e9])
 check("junk input is clamped, never NaN", junk.length === Eq.BANDS && junk.every(g => isFinite(g)))
 
 const t0 = performance.now()
-for (let i = 0; i < 50; i++) Eq.solve(Eq.preset("clearer"))
+for (let i = 0; i < 50; i++) Eq.solve(Eq.fromAnchors(shapes.clearer))
 const ms = (performance.now() - t0) / 50
 check("solve is quick enough to run while dragging", ms < 8, `${ms.toFixed(2)} ms`)
 
