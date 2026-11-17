@@ -9,11 +9,13 @@ import "Eq.js" as Eq
 // with a soft brush about a third of an octave wide, so it stays smooth. A
 // right drag paints back towards 0 dB, a double click makes it flat.
 //
-// Four layers. Behind: what your microphone picks up right now (a faint
-// shadow) and what the chain sends on (a thin line over it), both live from
-// the meter. In front: what you painted (filled), and what the filters
-// together with the high-pass actually do (the thin line). That last one is
-// computed with the same formulas PipeWire runs, so it is what you hear.
+// Behind: what your microphone picks up right now, as a live spectrum, with
+// a dotted line over it for the loudest each frequency has been in the last
+// second or two, and a label on the one that sticks out most. That is how you
+// find the frequency to paint away. With the chain on, a line for what it
+// sends on. In front: what you painted (filled), and what the filters together
+// with the high-pass actually do (the thin line). That last one is computed
+// with the same formulas PipeWire runs, so it is what you hear.
 Item {
   id: view
 
@@ -23,6 +25,13 @@ Item {
   property real highpassFreq: 80
   property var spectrum: []
   property var spectrumOut: []
+  property var peaks: []
+  // What the spectrum is of: the microphone, or the test recording while it plays.
+  property string inputLabel: "Microphone"
+  // The top of the spectrum's own scale, in dBFS; the plot shows spectrumSpan
+  // below it. The meter moves it to follow the microphone.
+  property real spectrumTop: -40
+  readonly property real spectrumSpan: 70
   property bool bypassed: false
 
   property color foreground: Color.foreground
@@ -137,8 +146,11 @@ Item {
     return pts
   }
 
-  // The spectrum gets its own scale: -96 to -24 dBFS fills the plot.
-  function specY(db) { return padTop + plotH - (Math.max(-96, Math.min(-24, db)) + 96) / 72 * plotH }
+  // The spectrum gets its own scale, separate from the curve's dB.
+  function specY(db) {
+    var bottom = spectrumTop - spectrumSpan
+    return padTop + plotH - (Math.max(bottom, Math.min(spectrumTop, db)) - bottom) / spectrumSpan * plotH
+  }
 
   // closed: down to the bottom and back, for a filled area; open: just the line.
   function spectrumPath(s, closed) {
@@ -152,8 +164,23 @@ Item {
   }
 
   readonly property var spectrumPoints: spectrumPath(view.spectrum, true)
-  readonly property var outputFill: spectrumPath(view.spectrumOut, true)
+  readonly property var spectrumEdge: spectrumPath(view.spectrum, false)
+  readonly property var peakLine: spectrumPath(view.peaks, false)
   readonly property var outputLine: spectrumPath(view.spectrumOut, false)
+  readonly property bool hasOutput: outputLine.length > 0
+
+  // The band that sticks out: the highest peak, if it stands at least 12 dB
+  // above the median of all of them. A flat room hum shows nothing; a voice,
+  // a whine or a boomy resonance does.
+  readonly property int loudest: {
+    var p = view.peaks
+    if (!p || p.length !== Eq.GRID) return -1
+    var sorted = p.slice().sort(function(a, b) { return a - b })
+    var median = sorted[Math.floor(sorted.length / 2)]
+    var best = 0
+    for (var k = 1; k < Eq.GRID; k++) if (p[k] > p[best]) best = k
+    return p[best] - median >= 12 ? best : -1
+  }
 
   // ---- drawing -----------------------------------------------------------
 
@@ -225,28 +252,41 @@ Item {
     layer.samples: 4
     preferredRendererType: Shape.CurveRenderer
 
-    // What the microphone hears right now.
+    // What the microphone hears right now: a filled spectrum with an edge.
+    // It steps back a little when the output line is drawn over it.
     ShapePath {
       strokeWidth: 0
       strokeColor: "transparent"
-      fillColor: view.alpha(view.foreground, view.spectrumPoints.length ? 0.07 : 0)
+      fillColor: view.alpha(view.foreground, view.spectrumPoints.length ? (view.hasOutput ? 0.11 : 0.15) : 0)
       PathPolyline { path: view.spectrumPoints.length ? view.spectrumPoints : [Qt.point(0, 0)] }
-    }
-
-    // What the chain sends on: a lighter wash with an edge, so where it
-    // parts from the shadow above is where the chain changed something.
-    ShapePath {
-      strokeWidth: 0
-      strokeColor: "transparent"
-      fillColor: view.alpha(view.foreground, view.outputFill.length ? 0.05 : 0)
-      PathPolyline { path: view.outputFill.length ? view.outputFill : [Qt.point(0, 0)] }
     }
     ShapePath {
       strokeWidth: 1
-      strokeColor: view.alpha(view.foreground, view.outputLine.length ? 0.38 : 0)
+      strokeColor: view.alpha(view.foreground, view.spectrumEdge.length ? (view.hasOutput ? 0.3 : 0.5) : 0)
       fillColor: "transparent"
       joinStyle: ShapePath.RoundJoin
-      PathPolyline { path: view.outputLine.length ? view.outputLine : [Qt.point(0, 0)] }
+      PathPolyline { path: view.spectrumEdge.length ? view.spectrumEdge : [Qt.point(0, 0)] }
+    }
+
+    // The loudest each frequency has been lately, dotted.
+    ShapePath {
+      strokeWidth: 1
+      strokeColor: view.alpha(view.foreground, view.peakLine.length ? 0.55 : 0)
+      fillColor: "transparent"
+      strokeStyle: ShapePath.DashLine
+      dashPattern: [2, 3]
+      joinStyle: ShapePath.RoundJoin
+      PathPolyline { path: view.peakLine.length ? view.peakLine : [Qt.point(0, 0)] }
+    }
+
+    // What the chain sends on: where it parts from the spectrum below is
+    // where the chain changed something.
+    ShapePath {
+      strokeWidth: Math.max(1, Style.space(1.2))
+      strokeColor: view.alpha(view.foreground, view.hasOutput ? 0.8 : 0)
+      fillColor: "transparent"
+      joinStyle: ShapePath.RoundJoin
+      PathPolyline { path: view.hasOutput ? view.outputLine : [Qt.point(0, 0)] }
     }
 
     // What you painted.
@@ -272,6 +312,46 @@ Item {
       fillColor: "transparent"
       joinStyle: ShapePath.RoundJoin
       PathPolyline { path: view.responsePoints }
+    }
+  }
+
+  // The frequency that sticks out: a dot on the peak line and its frequency,
+  // so you know where to paint.
+  Item {
+    id: loudMark
+    visible: view.loudest >= 0 && view.peaks.length === Eq.GRID
+    readonly property real fx: view.loudest >= 0 ? view.xOf(Eq.gridFreq(view.loudest)) : 0
+    readonly property real fy: view.loudest >= 0 ? view.specY(view.peaks[view.loudest]) : 0
+    anchors.fill: parent
+
+    Rectangle {
+      width: Style.space(6)
+      height: width
+      radius: width / 2
+      x: loudMark.fx - width / 2
+      y: loudMark.fy - height / 2
+      color: view.foreground
+    }
+
+    Rectangle {
+      readonly property real wanted: loudMark.fx - width / 2
+      x: Math.max(Style.space(2), Math.min(view.width - width - Style.space(2), wanted))
+      y: Math.max(view.padTop, loudMark.fy - height - Style.space(6))
+      width: loudText.implicitWidth + Style.space(8)
+      height: loudText.implicitHeight + Style.space(2)
+      radius: Style.cornerRadius > 0 ? Style.space(3) : 0
+      color: view.alpha(view.background, 0.85)
+
+      Text {
+        id: loudText
+        anchors.centerIn: parent
+        text: view.loudest >= 0 ? view.freqText(Eq.gridFreq(view.loudest)) : ""
+        textFormat: Text.PlainText
+        color: view.foreground
+        font.family: view.fontFamily
+        font.pixelSize: Math.round(Style.font.caption * 0.9)
+        font.bold: true
+      }
     }
   }
 
@@ -339,25 +419,48 @@ Item {
     font.letterSpacing: 1.2
   }
 
+  // On a plate of the background, because the spectrum fills this corner.
+  Rectangle {
+    visible: legend.visible
+    x: legend.x - Style.space(5)
+    y: legend.y - Style.space(2)
+    width: legend.width + Style.space(10)
+    height: legend.height + Style.space(4)
+    radius: Style.cornerRadius > 0 ? Style.space(3) : 0
+    color: view.alpha(view.background, 0.85)
+  }
+
   Row {
     id: legend
     visible: view.spectrumPoints.length > 0
     anchors.right: parent.right
-    anchors.rightMargin: Style.space(8)
-    y: view.padTop + view.plotH - height - Style.space(5)
+    anchors.rightMargin: Style.space(10)
+    y: view.padTop + view.plotH - height - Style.space(6)
     spacing: Style.space(10)
 
     Repeater {
-      model: view.outputLine.length ? [{ label: "Microphone", line: false }, { label: "Soundcheck output", line: true }]
-                                    : [{ label: "Microphone", line: false }]
+      model: [{ label: view.inputLabel, kind: "fill" }, { label: "Peak", kind: "dots" }]
+             .concat(view.hasOutput ? [{ label: "Soundcheck output", kind: "line" }] : [])
       delegate: Row {
         required property var modelData
         spacing: Style.space(4)
         Rectangle {
+          visible: modelData.kind !== "dots"
           anchors.verticalCenter: parent.verticalCenter
           width: Style.space(12)
-          height: modelData.line ? 1 : Style.space(7)
-          color: view.alpha(view.foreground, modelData.line ? 0.55 : 0.16)
+          height: modelData.kind === "line" ? Math.max(1, Style.space(1.2)) : Style.space(7)
+          color: view.alpha(view.foreground, modelData.kind === "line" ? 0.8 : 0.22)
+          border.width: modelData.kind === "fill" ? 1 : 0
+          border.color: view.alpha(view.foreground, 0.5)
+        }
+        Row {
+          visible: modelData.kind === "dots"
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: 3
+          Repeater {
+            model: 3
+            delegate: Rectangle { width: 2; height: 1; color: view.alpha(view.foreground, 0.7) }
+          }
         }
         Text {
           text: modelData.label

@@ -47,6 +47,9 @@ Singleton {
   property string micLabel: ""
   property bool micPresent: false
   property var mics: []
+  // False while the running chain was built by an older version of the
+  // plugin: the gate row then offers the restart that brings it up to date.
+  property bool graphCurrent: true
   property var sinks: []
   property var packages: ({ lsp: false, rnnoise: false })
   property var graph: ({ lsp: false, rnnoise: false })
@@ -79,7 +82,8 @@ Singleton {
       version: 1, mic: "", monitorSink: "", curve: curve, gains: gains,
       highpass: { on: true, freq: 80 }, denoise: { on: true, amount: 50 },
       gate: { on: true, threshold: -55 }, compressor: { on: true, threshold: -24, ratio: 3 },
-      limiter: { on: true, ceiling: -1 }, gain: 0
+      limiter: { on: true, ceiling: -1 }, distortion: { on: false, drive: 40 },
+      reverb: { on: false, amount: 30 }, gain: 0
     }
   }
 
@@ -117,6 +121,8 @@ Singleton {
     var s = copy(root.settings)
     s.highpass.on = false; s.denoise.on = false; s.gate.on = false
     s.compressor.on = false; s.limiter.on = false; s.gain = 0
+    if (s.distortion) s.distortion.on = false
+    if (s.reverb) s.reverb.on = false
     for (var i = 0; i < s.gains.length; i++) s.gains[i] = 0
     return s
   }
@@ -138,7 +144,7 @@ Singleton {
   LineProcess {
     id: statusProc
     command: root.argv(["status"])
-    onMessage: function(s) { root.applyStatus(s) }
+    handler: function(s) { root.applyStatus(s) }
   }
 
   function applyStatus(s) {
@@ -156,6 +162,7 @@ Singleton {
     root.sinks = root.cleanDevices(s.sinks)
     root.packages = { lsp: !!(s.packages && s.packages.lsp), rnnoise: !!(s.packages && s.packages.rnnoise) }
     root.graph = { lsp: !!(s.graph && s.graph.lsp), rnnoise: !!(s.graph && s.graph.rnnoise) }
+    root.graphCurrent = s.graphCurrent !== false
     root.recordingInfo = {
       before: !!(s.recording && s.recording.before), after: !!(s.recording && s.recording.after),
       seconds: Number(s.recording && s.recording.seconds) || 0
@@ -223,7 +230,7 @@ Singleton {
 
   LineProcess {
     id: saveProc
-    onMessage: function(r) { if (r.ok === false) root.error = root.label(r.error) }
+    handler: function(r) { if (r.ok === false) root.error = root.label(r.error) }
     onRunningChanged: if (!running && !saveTimer.running) { root.dirty = false; root.refresh() }
   }
 
@@ -251,7 +258,7 @@ Singleton {
 
   LineProcess {
     id: actionProc
-    onMessage: function(r) { if (r.ok === false) root.error = root.label(r.error) }
+    handler: function(r) { if (r.ok === false) root.error = root.label(r.error) }
     onRunningChanged: if (!running) {
       root.busy = false
       root.busyLabel = ""
@@ -268,6 +275,10 @@ Singleton {
   property var spectrum: []
   // What the chain sends on, measured the same way. Empty while it is off.
   property var spectrumOut: []
+  // The loudest each band has been in the last moment or two, and the top of
+  // the spectrum's scale, which follows the microphone (see the helper).
+  property var spectrumPeaks: []
+  property real spectrumTop: -40
   // The last six seconds for the gate's strip: the microphone's peak level,
   // and whether anything came out of the chain at that moment.
   property var gateHistory: []
@@ -289,26 +300,41 @@ Singleton {
   }
   property real meterStartedAt: 0
 
+  // While a test plays, the meter listens to it instead of the microphone,
+  // so the graph shows what you hear: the recording, and with After also what
+  // the preview of the chain makes of it.
+  readonly property string meterTap: root.playing && root.previewLive ? root.playWhich : ""
+  onMeterTapChanged: {
+    if (meterProc.running) meterProc.signal(15)   // comes back with the new source
+    else if (root.meterWanted) meterStart.restart()
+  }
+
   LineProcess {
     id: meterProc
-    command: root.argv(["meter"])
-    onMessage: function(m) {
+    command: root.argv(root.meterTap !== "" ? ["meter", root.meterTap] : ["meter"])
+    handler: function(m) {
       if (m.type === "level") {
         root.levelIn = root.db(m.in)
         root.levelPeak = root.db(m.inPeak)
         root.levelOut = root.db(m.out)
         var h = root.gateHistory.slice(Math.max(0, root.gateHistory.length - root.gateHistoryLength + 1))
-        h.push({ l: root.levelPeak, o: root.present && root.levelOut > -100 })
+        // The average level, not the peak: that is what the gate listens to.
+        h.push({ l: root.levelIn, o: root.present && root.levelOut > -100 })
         root.gateHistory = h
       } else if (m.type === "spectrum") {
         root.spectrum = root.bands(m.bands)
         root.spectrumOut = root.bands(m.out)
+        root.spectrumPeaks = root.bands(m.peaks)
+        var top = Number(m.top)
+        root.spectrumTop = isFinite(top) ? Math.max(-40, Math.min(0, top)) : -40
       }
     }
     onRunningChanged: if (!running) {
       root.levelIn = -120; root.levelPeak = -120; root.levelOut = -120
       root.spectrum = []
       root.spectrumOut = []
+      root.spectrumPeaks = []
+      root.spectrumTop = -40
       root.gateHistory = []
       if (!root.meterWanted) { meterStart.interval = 250; return }
       // Quick deaths (no microphone yet) back off instead of spinning.
@@ -440,7 +466,7 @@ Singleton {
   LineProcess {
     id: recordProc
     command: root.argv(["record"])
-    onMessage: function(m) {
+    handler: function(m) {
       if (m.type === "record") {
         root.recordElapsed = Number(m.elapsed) || 0
         root.recordLevel = root.db(m.level)
@@ -475,6 +501,8 @@ Singleton {
     playProc.running = true
   }
   property string pendingPlay: ""
+  // True once the playback is actually running (the preview takes a moment).
+  property bool previewLive: false
 
   function stopPlay() { if (playProc.running) playProc.signal(15) }
 
@@ -488,8 +516,9 @@ Singleton {
 
   LineProcess {
     id: playProc
-    onMessage: function(m) {
+    handler: function(m) {
       if (m.type === "play") {
+        root.previewLive = true
         root.playPosition = Number(m.position) || 0
         root.playLength = Number(m.length) || 0
       } else if (m.ok === false) {
@@ -498,6 +527,7 @@ Singleton {
     }
     onRunningChanged: if (!running) {
       root.playing = false
+      root.previewLive = false
       if (root.pendingPlay !== "") { var next = root.pendingPlay; root.pendingPlay = ""; root.play(next) }
     }
   }

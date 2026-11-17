@@ -321,6 +321,9 @@ Panel {
             highpassFreq: store.settings.highpass.freq
             spectrum: store.spectrum
             spectrumOut: store.spectrumOut
+            peaks: store.spectrumPeaks
+            inputLabel: store.meterTap !== "" ? "Test recording" : "Microphone"
+            spectrumTop: store.spectrumTop
             bypassed: store.bypass
             foreground: root.foreground
             accent: root.accent
@@ -385,6 +388,9 @@ Panel {
               width: chain.width
               bar: root.bar
               title: "Noise gate"
+              mode: store.on && !store.graphCurrent ? "restart" : "ready"
+              restartText: "Soundcheck has a new noise gate. Restarting the chain puts it in (a second of silence on the microphone)."
+              onRestartRequested: store.reload()
               checked: store.settings.gate.on
               minimum: -90; maximum: -10; step: 1; bigStep: 6
               value: store.settings.gate.threshold
@@ -435,6 +441,44 @@ Panel {
                 onRestartRequested: store.reload()
               }
 
+            }
+
+            // The two for fun: grit and a room. Built into PipeWire, nothing
+            // to install; a chain from an older version needs one restart.
+            Row {
+              spacing: Style.space(14)
+
+              StepRow {
+                width: chain.cell
+                bar: root.bar
+                title: "Distortion"
+                mode: store.on && !store.graphCurrent ? "restart" : "ready"
+                restartText: "New in Soundcheck. Restarting the chain adds it (a second of silence on the microphone)."
+                checked: store.settings.distortion.on
+                minimum: 0; maximum: 100; step: 1; bigStep: 10
+                value: store.settings.distortion.drive
+                valueText: Math.round(store.settings.distortion.drive) + "%"
+                foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
+                onToggled: store.change(function(s) { s.distortion.on = !s.distortion.on })
+                onMoved: function(v) { store.change(function(s) { s.distortion.drive = Math.round(v) }) }
+                onRestartRequested: store.reload()
+              }
+
+              StepRow {
+                width: chain.cell
+                bar: root.bar
+                title: "Reverb"
+                mode: store.on && !store.graphCurrent ? "restart" : "ready"
+                restartText: "New in Soundcheck. Restarting the chain adds it (a second of silence on the microphone)."
+                checked: store.settings.reverb.on
+                minimum: 0; maximum: 100; step: 1; bigStep: 10
+                value: store.settings.reverb.amount
+                valueText: Math.round(store.settings.reverb.amount) + "%"
+                foreground: root.foreground; accent: root.accent; background: root.background; fontFamily: root.fontFamily
+                onToggled: store.change(function(s) { s.reverb.on = !s.reverb.on })
+                onMoved: function(v) { store.change(function(s) { s.reverb.amount = Math.round(v) }) }
+                onRestartRequested: store.reload()
+              }
             }
 
             StepRow {

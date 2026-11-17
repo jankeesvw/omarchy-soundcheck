@@ -25,6 +25,7 @@ Item {
   // chain has not been rebuilt with it yet).
   property string mode: "ready"
   property string packageName: ""
+  property string restartText: "Installed. Restarting the chain adds it (a second of silence on the microphone)."
   property string hint: ""
 
   // The gate's history strip: the last seconds of the microphone with the
@@ -189,7 +190,7 @@ Item {
       visible: row.mode !== "ready"
       width: parent.width
       text: row.mode === "missing" ? "Needs " + row.packageName + ". The button copies omarchy pkg add " + row.packageName + "."
-                                   : "Installed. Restarting the chain adds it (a second of silence on the microphone)."
+                                   : row.restartText
       textFormat: Text.PlainText
       wrapMode: Text.Wrap
       color: row.fade(row.foreground, 0.35)

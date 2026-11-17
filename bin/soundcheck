@@ -34,10 +34,13 @@ Why it is shaped like this:
 import array
 import cmath
 import errno
+import io
+import fcntl
 import json
 import math
 import os
 import pwd
+import random
 import re
 import secrets
 import select
@@ -56,9 +59,32 @@ NODE_SOURCE = "soundcheck_mic"
 NODE_CAPTURE = "soundcheck_capture"
 NODE_PREFIX = "soundcheck"
 SOURCE_LABEL = "Soundcheck Microphone"
+# The preview: the test recording through a chain of its own, so changes are
+# heard on it while it plays, without the recording ever reaching an app.
+NODE_PREVIEW_IN = "soundcheck_preview_in"
+NODE_PREVIEW_OUT = "soundcheck_preview_out"
+NODE_PLAY = "soundcheck_play"
+PREVIEW_CONF = "preview.conf"
 
 RATE = 48000
 BANDS = 30
+# Bumped when the shape of the chain changes, so a chain built by an older
+# version is recognised and offered a restart instead of being sent controls
+# it does not have. 2: the noise gate built from parts (see render).
+# 3: distortion and reverb.
+GRAPH_VERSION = 3
+# The gate is shut 3 dB under its threshold and fully open 3 dB over it.
+GATE_KNEE_DB = 6.0
+# log node: M2 * ln(M1 * x) with x = 10 * level, which makes its output
+# (20 * log10(level) + 40) / GATE_KNEE_DB: one unit per knee width.
+GATE_LOG_M2 = 20.0 / (GATE_KNEE_DB * math.log(10.0))
+GATE_LOG_OFFSET = 40.0 / GATE_KNEE_DB
+# Distortion: the slider (0 to 100) is up to this much drive, in dB.
+DRIVE_MAX_DB = 36.0
+# Reverb: the impulse response the convolver plays, written next to the
+# config, and how long the room rings.
+REVERB_FILE = "reverb.wav"
+REVERB_SECONDS = 0.9
 GRID = 59
 BAND_Q = 2.5
 
@@ -78,6 +104,7 @@ PW_CLI = "/usr/bin/pw-cli"
 PW_RECORD = "/usr/bin/pw-record"
 PW_PLAY = "/usr/bin/pw-play"
 PW_METADATA = "/usr/bin/pw-metadata"
+PW_LINK = "/usr/bin/pw-link"
 PIPEWIRE = "/usr/bin/pipewire"
 PACTL = "/usr/bin/pactl"
 SYSTEMCTL = "/usr/bin/systemctl"
@@ -218,11 +245,11 @@ def kill_group(proc):
             continue
 
 
-def spawn(argv, stdin=False):
+def spawn(argv, stdin=False, quiet=False):
     """A long-running child whose stdout we stream (meter, record, play)."""
     return subprocess.Popen(
         argv, stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL if stdin else subprocess.PIPE,
+        stdout=subprocess.DEVNULL if stdin or quiet else subprocess.PIPE,
         stderr=subprocess.DEVNULL, env=child_env(),
         start_new_session=True, close_fds=True)
 
@@ -403,6 +430,8 @@ def default_settings():
         "gate": {"on": True, "threshold": -55.0},
         "compressor": {"on": True, "threshold": -24.0, "ratio": 3.0},
         "limiter": {"on": True, "ceiling": -1.0},
+        "distortion": {"on": False, "drive": 40.0},
+        "reverb": {"on": False, "amount": 30.0},
         "gain": 0.0,
     }
 
@@ -444,6 +473,10 @@ def normalise(raw):
                        "ratio": round(clamp(finite(cp.get("ratio"), 3.0), 1.0, 10.0), 2)}
     lm = section("limiter")
     s["limiter"] = {"on": onoff(lm, True), "ceiling": round(clamp(finite(lm.get("ceiling"), -1.0), -12.0, 0.0), 1)}
+    ds = section("distortion")
+    s["distortion"] = {"on": onoff(ds, False), "drive": round(clamp(finite(ds.get("drive"), 40.0), 0.0, 100.0), 1)}
+    rv = section("reverb")
+    s["reverb"] = {"on": onoff(rv, False), "amount": round(clamp(finite(rv.get("amount"), 30.0), 0.0, 100.0), 1)}
     s["gain"] = round(clamp(finite(raw.get("gain"), 0.0), -12.0, 12.0), 1)
     return s
 
@@ -494,7 +527,10 @@ def load_state():
         st = {}
     graph = st.get("graph") if isinstance(st.get("graph"), dict) else {}
     restore = st.get("restoreSource", "")
-    return {"graph": {"lsp": graph.get("lsp") is True, "rnnoise": graph.get("rnnoise") is True},
+    v = graph.get("v")
+    return {"graph": {"lsp": graph.get("lsp") is True, "rnnoise": graph.get("rnnoise") is True,
+                      "reverb": graph.get("reverb") is True,
+                      "v": v if isinstance(v, int) and not isinstance(v, bool) else 1},
             "restoreSource": restore if valid_name(restore) and not restore.startswith(NODE_PREFIX) else ""}
 
 
@@ -558,7 +594,7 @@ def demo_status():
         "sinks": [{"name": s["monitorSink"], "label": "Headphones", "headphones": True},
                   {"name": "alsa_output.usb-Desk_Speakers-00.analog-stereo", "label": "Desk Speakers", "headphones": False}],
         "packages": {"lsp": True, "rnnoise": True},
-        "graph": {"lsp": True, "rnnoise": True},
+        "graph": {"lsp": True, "rnnoise": True, "reverb": True, "v": GRAPH_VERSION}, "graphCurrent": True,
         "recording": {"before": True, "after": True, "seconds": 6.4},
         "settings": s,
     }
@@ -670,7 +706,65 @@ def unit_active():
 
 def packages():
     return {"lsp": file_exists(os.path.join(LSP_DIR, "compressor_mono.ttl")) and file_exists(os.path.join(LSP_DIR, "limiter_mono.ttl")),
-            "rnnoise": file_exists(RNNOISE_LIB)}
+            "rnnoise": file_exists(RNNOISE_LIB), "reverb": reverb_path() is not None, "v": GRAPH_VERSION}
+
+
+def reverb_path():
+    """Where the convolver finds the room, if that path can go in the config."""
+    path = os.path.join(HOME, ".config", "omarchy-soundcheck", REVERB_FILE)
+    return path if re.fullmatch(r"/[A-Za-z0-9/._-]+", path) else None
+
+
+_reverb = None
+
+
+def reverb_ir():
+    """A medium room, made up: (WAV bytes, the gain that makes it unity).
+
+    Noise that dies away over REVERB_SECONDS (-60 dB at the end), darker as
+    it goes the way a real room swallows the highs first, after a short gap
+    and a few early echoes off near walls. Seeded, so it is the same room on
+    every machine and after every restart.
+    """
+    global _reverb
+    if _reverb is None:
+        rnd = random.Random(1983)
+        n = int(RATE * REVERB_SECONDS)
+        pre = int(RATE * 0.012)
+        h = [0.0] * n
+        lp = 0.0
+        for i in range(pre, n):
+            age = (i - pre) / RATE
+            coef = 0.55 * math.exp(-age * 2.5) + 0.08
+            lp += coef * (rnd.gauss(0.0, 1.0) - lp)
+            h[i] = lp * math.exp(-6.91 * age / REVERB_SECONDS)
+        for ms, g in ((7, 1.4), (13, -1.0), (19, 0.85), (29, -0.6), (37, 0.5)):
+            h[pre + int(RATE * ms / 1000)] += g
+        peak = max(abs(v) for v in h)
+        pcm = array.array("h", (int(round(v / peak * 0.9 * 32767)) for v in h))
+        energy = sum((v / 32768.0) ** 2 for v in pcm)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(RATE)
+            w.writeframes(pcm.tobytes())
+        _reverb = (buf.getvalue(), 1.0 / math.sqrt(energy))
+    return _reverb
+
+
+def ensure_reverb(fd):
+    """Write the room next to the config unless it is already there."""
+    data = reverb_ir()[0]
+    have = open_regular(fd, REVERB_FILE, len(data) + 1)
+    if have is not None:
+        try:
+            same = os.read(have, len(data) + 1) == data
+        finally:
+            os.close(have)
+        if same:
+            return
+    write_file(fd, REVERB_FILE, data)
 
 
 def pick_mic(settings, mics, current_default):
@@ -689,13 +783,14 @@ def recording_info():
     except (OSError, PermissionError):
         return info
     try:
-        for which in ("before", "after"):
-            f = open_regular(fd, f"{which}.wav", RECORD_BYTES + 4096)
-            if f is not None:
-                st = os.fstat(f)
-                os.close(f)
-                info[which] = st.st_size > 44
-                info["seconds"] = max(info["seconds"], round(max(0, st.st_size - 44) / (RATE * 2), 1))
+        f = open_regular(fd, "before.wav", RECORD_BYTES + 4096)
+        if f is not None:
+            st = os.fstat(f)
+            os.close(f)
+            # After is the same recording through the chain, so it exists
+            # whenever Before does.
+            info["before"] = info["after"] = st.st_size > 44
+            info["seconds"] = round(max(0, st.st_size - 44) / (RATE * 2), 1)
     except PermissionError:
         pass
     finally:
@@ -730,6 +825,7 @@ def status():
         "sinks": list_sinks(sinks),
         "packages": packages(),
         "graph": state["graph"],
+        "graphCurrent": state["graph"]["v"] == GRAPH_VERSION,
         "recording": recording_info(),
         "settings": settings,
     }
@@ -768,10 +864,9 @@ def controls(s, graph):
         c["mix:Gain 1"] = 1.0 if dn["on"] else 0.0
         c["mix:Gain 2"] = 0.0 if dn["on"] else 1.0
     gt = s["gate"]
-    # The gate closes 6 dB below where it opens, so a voice trailing off at the
-    # threshold does not flutter the gate open and shut.
-    c["gate:Open Threshold"] = lin(gt["threshold"]) if gt["on"] else 0.0
-    c["gate:Close Threshold"] = lin(gt["threshold"] - 6) if gt["on"] else 0.0
+    # Off: the knee's floor goes up to 1, so the gain is 1 whatever it hears.
+    c["g_lin:Add"] = -(gt["threshold"] - GATE_KNEE_DB / 2) / GATE_KNEE_DB - GATE_LOG_OFFSET if gt["on"] else 0.0
+    c["g_knee:Min"] = 0.0 if gt["on"] else 1.0
     for i in range(BANDS):
         c[f"eq_{i:02d}:Gain"] = s["gains"][i]
     if graph.get("lsp"):
@@ -785,13 +880,29 @@ def controls(s, graph):
         lm = s["limiter"]
         c["lim:enabled"] = 1.0 if lm["on"] else 0.0
         c["lim:th"] = lin(lm["ceiling"])
+    ds = s["distortion"]
+    drive = ds["drive"] / 100.0 * DRIVE_MAX_DB
+    # Half the drive in each of two stages: one linear node goes to 10 at most.
+    c["d_pre:Mult"] = c["d_pre2:Mult"] = 10 ** (drive / 40.0)
+    # Back down by the drive, less what the clipper takes off a voice at a
+    # normal level (measured: about drive^2 / 110 dB), so the slider changes
+    # the grit and not the loudness.
+    c["d_post:Mult"] = 10 ** ((drive * drive / 110.0 - drive) / 20.0)
+    c["d_mix:Gain 1"] = 1.0 if ds["on"] else 0.0
+    c["d_mix:Gain 2"] = 0.0 if ds["on"] else 1.0
+    if graph.get("reverb"):
+        rv = s["reverb"]
+        c["rv_mix:Gain 1"] = rv["amount"] / 100.0 * 0.7 if rv["on"] else 0.0
+        c["rv_mix:Gain 2"] = 1.0
     c["out:Mult"] = lin(s["gain"])
     return c
 
 
-def render(s, graph, mic):
-    if not valid_name(mic):
-        raise ValueError("no microphone to listen to")
+def render(s, graph, mic, preview_sink=None):
+    """The chain as a PipeWire config. With preview_sink: the preview's copy of
+    it, fed by hand from the test recording and played on that output."""
+    if not valid_name(preview_sink if preview_sink else mic):
+        raise ValueError("no microphone to listen to" if not preview_sink else "not an output name")
     live = controls(s, graph)
 
     def ctl(node, fixed=None):
@@ -815,9 +926,38 @@ def render(s, graph, mic):
         links += [f'{{ output = "{last}" input = "rn:Input" }}', f'{{ output = "{last}" input = "dry:In" }}',
                   '{ output = "rn:Output" input = "mix:In 1" }', '{ output = "dry:Out" input = "mix:In 2" }']
         last = "mix:Out"
-    nodes.append(f'{{ type = builtin name = gate label = noisegate '
-                 f'{ctl("gate", {"Attack (s)": 0.004, "Hold (s)": 0.25, "Release (s)": 0.15})} }}')
-    links.append(f'{{ output = "{last}" input = "gate:In" }}')
+    # The noise gate, built from PipeWire's smallest parts. Its own noisegate
+    # (1.6) never measures what comes in: it only does so while its Level
+    # control is NaN, and that never survives into the running graph, so it
+    # compares the threshold with 0 and stays shut. Here the level is measured
+    # by hand: rectified and smoothed (g_env), taken to a log scale so the
+    # threshold is a plain offset (g_log, g_lin), and squeezed into a gain of
+    # 0 to 1 over a 6 dB knee (g_knee). That gain opens fast and lets go
+    # slowly (g_slow, g_max), is smoothed against clicks, and multiplies the
+    # voice (gate). Every value stays inside the range PipeWire gives it.
+    for name, label, fixed in (
+        ("gin", "copy", {}),
+        ("g_abs", "abs", {}),
+        ("g_env", "bq_lowpass", {"Freq": 30.0, "Q": 0.5}),
+        ("g_pre", "linear", {"Mult": 10.0, "Add": 0.0}),
+        ("g_floor", "clamp", {"Min": 0.00001, "Max": 100.0}),
+        ("g_log", "log", {"Base": math.e, "M1": 10.0, "M2": GATE_LOG_M2}),
+        ("g_lin", "linear", {"Mult": 1.0}),
+        ("g_knee", "clamp", {"Max": 1.0}),
+        ("g_slow", "bq_lowpass", {"Freq": 6.0, "Q": 0.5}),
+        ("g_max", "max", {}),
+        ("g_smooth", "bq_lowpass", {"Freq": 60.0, "Q": 0.707}),
+        ("g_gain", "clamp", {"Min": 0.0, "Max": 1.0}),
+        ("gate", "mult", {}),
+    ):
+        nodes.append(f'{{ type = builtin name = {name} label = {label} {ctl(name, fixed)} }}')
+    links += [f'{{ output = "{last}" input = "gin:In" }}']
+    for src, dst in (("gin", "g_abs"), ("g_abs", "g_env"), ("g_env", "g_pre"), ("g_pre", "g_floor"),
+                     ("g_floor", "g_log"), ("g_log", "g_lin"), ("g_lin", "g_knee"), ("g_knee", "g_slow"),
+                     ("g_max", "g_smooth"), ("g_smooth", "g_gain")):
+        links.append(f'{{ output = "{src}:Out" input = "{dst}:In" }}')
+    links += ['{ output = "g_knee:Out" input = "g_max:In 1" }', '{ output = "g_slow:Out" input = "g_max:In 2" }',
+              '{ output = "gin:Out" input = "gate:In 1" }', '{ output = "g_gain:Out" input = "gate:In 2" }']
     last = "gate:Out"
     for i in range(BANDS):
         name = f"eq_{i:02d}"
@@ -825,18 +965,85 @@ def render(s, graph, mic):
                      f'{ctl(name, {"Freq": band_freq(i), "Q": band_q(i)})} }}')
         links.append(f'{{ output = "{last}" input = "{name}:In" }}')
         last = f"{name}:Out"
+    # Distortion: a soft clipper, x / (1 + |x|), after the drive and before a
+    # level that keeps the voice about as loud as it was. Off, the mixer
+    # passes the dry voice and nothing of the clipped one.
+    for name, label, fixed in (
+        ("din", "copy", {}),
+        ("d_pre", "linear", {"Add": 0.0}),
+        ("d_pre2", "linear", {"Add": 0.0}),
+        ("d_abs", "abs", {}),
+        ("d_one", "linear", {"Mult": 1.0, "Add": 1.0}),
+        ("d_rec", "recip", {}),
+        ("d_clip", "mult", {}),
+        ("d_post", "linear", {"Add": 0.0}),
+        ("d_mix", "mixer", {}),
+    ):
+        nodes.append(f'{{ type = builtin name = {name} label = {label} {ctl(name, fixed)} }}')
+    links.append(f'{{ output = "{last}" input = "din:In" }}')
+    for src, dst in (("din", "d_pre"), ("d_pre", "d_pre2"), ("d_pre2", "d_abs"), ("d_abs", "d_one"),
+                     ("d_one", "d_rec"), ("d_clip", "d_post")):
+        links.append(f'{{ output = "{src}:Out" input = "{dst}:In" }}')
+    links += ['{ output = "d_pre2:Out" input = "d_clip:In 1" }', '{ output = "d_rec:Out" input = "d_clip:In 2" }',
+              '{ output = "d_post:Out" input = "d_mix:In 1" }', '{ output = "din:Out" input = "d_mix:In 2" }']
+    last = "d_mix:Out"
     if graph.get("lsp"):
         nodes.append(f'{{ type = lv2 name = comp plugin = "{LSP_COMPRESSOR}" '
                      f'{ctl("comp", {"at": 8, "rt": 120, "kn": 0.5, "scm": 1, "sla": 0, "g_in": 1, "g_out": 1})} }}')
+        links.append(f'{{ output = "{last}" input = "comp:in" }}')
+        last = "comp:out"
+    # Reverb: the room (see reverb_ir) mixed in under the dry voice, after the
+    # compressor so its tail is not squeezed, before the limiter so nothing
+    # it adds goes past the ceiling.
+    path = reverb_path()
+    if graph.get("reverb") and path:
+        nodes.append('{ type = builtin name = rin label = copy }')
+        nodes.append(f'{{ type = builtin name = rv label = convolver config = {{ filename = "{path}" gain = {num(reverb_ir()[1])} }} }}')
+        nodes.append(f'{{ type = builtin name = rv_mix label = mixer {ctl("rv_mix")} }}')
+        links += [f'{{ output = "{last}" input = "rin:In" }}', '{ output = "rin:Out" input = "rv:In" }',
+                  '{ output = "rv:Out" input = "rv_mix:In 1" }', '{ output = "rin:Out" input = "rv_mix:In 2" }']
+        last = "rv_mix:Out"
+    if graph.get("lsp"):
         nodes.append(f'{{ type = lv2 name = lim plugin = "{LSP_LIMITER}" '
                      f'{ctl("lim", {"alr": 0, "boost": 0, "lk": 1.0, "at": 1.0, "rt": 10.0, "g_in": 1, "g_out": 1})} }}')
-        links += [f'{{ output = "{last}" input = "comp:in" }}', '{ output = "comp:out" input = "lim:in" }']
+        links.append(f'{{ output = "{last}" input = "lim:in" }}')
         last = "lim:out"
     nodes.append(f'{{ type = builtin name = out label = linear {ctl("out", {"Add": 0})} }}')
     links.append(f'{{ output = "{last}" input = "out:In" }}')
 
     node_lines = "\n                    ".join(nodes)
     link_lines = "\n                    ".join(links)
+    if preview_sink:
+        props = f"""capture.props = {{
+                node.name        = "{NODE_PREVIEW_IN}"
+                node.description = "Soundcheck preview"
+                # Linked by hand to the test recording and nothing else.
+                node.autoconnect = false
+            }}
+            playback.props = {{
+                node.name          = "{NODE_PREVIEW_OUT}"
+                node.description   = "Soundcheck preview"
+                target.object      = "{preview_sink}"
+                node.dont-fallback = true
+                media.role         = Production
+            }}"""
+    else:
+        props = f"""capture.props = {{
+                node.name          = "{NODE_CAPTURE}"
+                node.description   = "Soundcheck input"
+                target.object      = "{mic}"
+                # The default source is the chain itself: falling back to it
+                # would feed the chain its own output.
+                node.dont-fallback = true
+                # Only opens the microphone while something listens to it.
+                node.passive       = true
+            }}
+            playback.props = {{
+                node.name        = "{NODE_SOURCE}"
+                node.description = "{SOURCE_LABEL}"
+                media.class      = Audio/Source
+                device.icon-name = "audio-input-microphone"
+            }}"""
     return f"""# Written by the Soundcheck plugin ({PLUGIN_ID}); rewritten on every change.
 # Run as its own PipeWire client: pipewire -c <this file>
 # soundcheck-graph: lsp={int(bool(graph.get("lsp")))} rnnoise={int(bool(graph.get("rnnoise")))}
@@ -875,22 +1082,7 @@ context.modules = [
             audio.rate     = {RATE}
             audio.channels = 1
             audio.position = [ MONO ]
-            capture.props = {{
-                node.name          = "{NODE_CAPTURE}"
-                node.description   = "Soundcheck input"
-                target.object      = "{mic}"
-                # The default source is the chain itself: falling back to it
-                # would feed the chain its own output.
-                node.dont-fallback = true
-                # Only opens the microphone while something listens to it.
-                node.passive       = true
-            }}
-            playback.props = {{
-                node.name        = "{NODE_SOURCE}"
-                node.description = "{SOURCE_LABEL}"
-                media.class      = Audio/Source
-                device.icon-name = "audio-input-microphone"
-            }}
+            {props}
         }}
     }}
 ]
@@ -927,16 +1119,33 @@ def conf_path():
 def write_conf(settings, graph, mic):
     fd = config_dir()
     try:
+        if graph.get("reverb"):
+            ensure_reverb(fd)
         write_file(fd, "pipewire.conf", render(settings, graph, mic).encode())
     finally:
         os.close(fd)
 
 
-def apply_live(settings, graph):
-    """Send every control to the running chain. Quick: one pw-cli, ~10 ms."""
+def apply_live(settings, graph, node=NODE_CAPTURE):
+    """Send every control to a running chain. Quick: one pw-cli, ~10 ms."""
     parts = " ".join(f'"{k}" {num(v)}' for k, v in controls(settings, graph).items())
-    rc, _, err = run([PW_CLI, "s", NODE_CAPTURE, "Props", "{ params = [ " + parts + " ] }"], timeout=3, cap=PWCLI_BYTES)
+    rc, _, err = run([PW_CLI, "s", node, "Props", "{ params = [ " + parts + " ] }"], timeout=3, cap=PWCLI_BYTES)
     return rc == 0
+
+
+def preview_running():
+    """Whether a preview is playing: its config only exists while it does."""
+    try:
+        fd = runtime_dir()
+    except (OSError, PermissionError):
+        return False
+    try:
+        os.stat(PREVIEW_CONF, dir_fd=fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+    finally:
+        os.close(fd)
 
 
 def source_index(sources, name):
@@ -1075,7 +1284,7 @@ def cmd_off():
         move_streams(app_streams_on(ours), back)
     teardown()
     wait_for_node(False, 4.0)
-    state["graph"] = {"lsp": False, "rnnoise": False}
+    state["graph"] = {"lsp": False, "rnnoise": False, "v": GRAPH_VERSION}
     store_json("state.json", state)
     emit({"ok": True, "restored": back})
 
@@ -1115,6 +1324,8 @@ def cmd_live(text, persist):
     # which is what `soundcheck mic` is for.
     settings["mic"] = stored["mic"]
     applied = apply_live(settings, state["graph"]) if unit_installed() else False
+    if preview_running():
+        apply_live(settings, packages(), NODE_PREVIEW_IN)
     if persist:
         store_json("settings.json", settings)
         if unit_installed() and settings["mic"]:
@@ -1162,6 +1373,12 @@ def cmd_demo(arg):
 # ------------------------------------------------------------ the meter
 
 FFT_N = 4096
+SPECTRUM_EVERY = 0.05     # 20 a second: fast enough to watch a word move
+RELEASE_DB_S = 36.0       # how fast a band falls back once the sound stops
+PEAK_HOLD_S = 1.5         # how long a band's loudest moment stays marked
+PEAK_FALL_DB_S = 18.0     # and how fast that mark sinks afterwards
+SPAN_DB = 70.0            # the height of the plot, in dB
+TOP_MIN, TOP_MAX = -40.0, 0.0
 _rev = None
 _tw = None
 _win = None
@@ -1212,6 +1429,49 @@ def band_levels(power):
     return out
 
 
+class Analyzer:
+    """What the panel draws behind the curve, from one FFT to the next.
+
+    A raw FFT jumps around too much to read, so it gets the ballistics of a
+    hardware analyzer: a band rises at once and falls back at RELEASE_DB_S.
+    Each band also keeps its loudest recent moment (the peak line), which is
+    what shows a frequency that keeps sticking out. And the scale follows the
+    microphone: its top sits a little above the loudest peak, so a quiet USB
+    microphone fills the plot as well as a hot laptop one, but never sinks
+    below TOP_MIN, so a silent room stays low instead of being blown up.
+    """
+
+    def __init__(self, sides):
+        self.shown = {side: [-120.0] * GRID for side in sides}
+        self.peaks = [-120.0] * GRID
+        self.peak_at = [0.0] * GRID
+        self.top = TOP_MIN
+
+    def update(self, fresh, now, dt):
+        dt = clamp(dt, 0.0, 0.5)
+        for side, bands in fresh.items():
+            shown = self.shown[side]
+            for k in range(GRID):
+                shown[k] = bands[k] if bands[k] >= shown[k] else max(bands[k], shown[k] - RELEASE_DB_S * dt)
+        mic = self.shown["in"]
+        for k in range(GRID):
+            if mic[k] >= self.peaks[k]:
+                self.peaks[k] = mic[k]
+                self.peak_at[k] = now
+            elif now - self.peak_at[k] > PEAK_HOLD_S:
+                self.peaks[k] = max(mic[k], self.peaks[k] - PEAK_FALL_DB_S * dt)
+        target = clamp(max(self.peaks) + 6.0, TOP_MIN, TOP_MAX)
+        rate = 6.0 if target > self.top else 0.5
+        self.top += (target - self.top) * min(1.0, dt * rate)
+
+    def message(self):
+        msg = {"type": "spectrum", "bands": [round(v, 1) for v in self.shown["in"]],
+               "peaks": [round(v, 1) for v in self.peaks], "top": round(self.top, 1)}
+        if "out" in self.shown:
+            msg["out"] = [round(v, 1) for v in self.shown["out"]]
+        return msg
+
+
 def level_db(samples):
     if not samples:
         return -120.0, -120.0
@@ -1226,36 +1486,64 @@ def record_argv(target, fmt, node_name, latency="20ms"):
     # microphone (Intel SOF) a second recorder with it set stalls after a few
     # kilobytes as soon as the chain is being listened to, which left the
     # meter and the Before half of a test silent.
-    return [PW_RECORD, "--target", target, "--rate", str(RATE), "--channels", "1",
+    # Without a target the recorder waits to be linked by hand (pw-link).
+    where = ["--target", target] if target else []
+    extra = "" if target else " node.autoconnect = false"
+    return [PW_RECORD] + where + ["--rate", str(RATE), "--channels", "1",
             "--format", fmt, "--raw", "--latency", latency,
-            "--properties", "{ node.name = " + node_name + " media.role = Production }",
+            "--properties", "{ node.name = " + node_name + " media.role = Production" + extra + " }",
             "-"]
 
 
-def cmd_meter():
+def cmd_meter(tap=""):
+    """Levels and spectra, as JSON lines, until stopped.
+
+    Normally of the microphone and what the chain sends on. With tap "before"
+    or "after", of the test recording while it plays (and, for after, of what
+    the preview makes of it), so the graph shows what you hear.
+    """
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     if demo_on():
         demo_meter()
         return
-    settings = load_settings()
-    sources = pactl_json("sources")
-    mic = pick_mic(settings, list_mics(sources), default_source())
-    if not mic:
-        fail("no microphone found")
-    chain = source_index(sources, NODE_SOURCE) is not None
-    procs = {"in": spawn(record_argv(mic, "f32", "soundcheck_meter_in"))}
-    if chain:
-        procs["out"] = spawn(record_argv(NODE_SOURCE, "f32", "soundcheck_meter_out"))
+    if tap in ("before", "after"):
+        # Streams cannot be a recorder's target, so these are linked by hand.
+        wires = {"in": f"{NODE_PLAY}:output_MONO"}
+        if tap == "after":
+            wires["out"] = f"{NODE_PREVIEW_OUT}:output_MONO"
+        procs = {key: spawn(record_argv(None, "f32", f"soundcheck_meter_{key}")) for key in wires}
+        try:
+            for key, src in wires.items():
+                dst = f"soundcheck_meter_{key}:input_MONO"
+                if not (wait_for_port("-o", src) and wait_for_port("-i", dst)):
+                    fail("nothing is playing")
+                if run([PW_LINK, src, dst], timeout=3)[0] != 0:
+                    fail("could not listen to the playback")
+        except BaseException:
+            for proc in procs.values():
+                kill_group(proc)
+            raise
+    else:
+        settings = load_settings()
+        sources = pactl_json("sources")
+        mic = pick_mic(settings, list_mics(sources), default_source())
+        if not mic:
+            fail("no microphone found")
+        chain = source_index(sources, NODE_SOURCE) is not None
+        procs = {"in": spawn(record_argv(mic, "f32", "soundcheck_meter_in"))}
+        if chain:
+            procs["out"] = spawn(record_argv(NODE_SOURCE, "f32", "soundcheck_meter_out"))
     fds = {p.stdout.fileno(): key for key, p in procs.items()}
     pending = {key: b"" for key in procs}
     recent = {key: array.array("f") for key in procs}
     # The last FFT_N samples of both sides: the microphone as it comes in, and
     # what the chain makes of it, so the panel can draw one over the other.
     rings = {key: array.array("f", [0.0] * FFT_N) for key in procs}
-    next_level = next_spec = time.monotonic()
+    analyzer = Analyzer(procs)
+    next_level = next_spec = last_spec = time.monotonic()
     try:
         while fds:
-            ready, _, _ = select.select(list(fds), [], [], 0.25)
+            ready, _, _ = select.select(list(fds), [], [], SPECTRUM_EVERY)
             for fd in ready:
                 key = fds[fd]
                 chunk = os.read(fd, 65536)
@@ -1283,11 +1571,10 @@ def cmd_meter():
                     del recent[key][:]
                 emit(msg)
             if now >= next_spec:
-                next_spec = now + 0.1
-                msg = {"type": "spectrum", "bands": band_levels(fft_power(rings["in"]))}
-                if "out" in rings:
-                    msg["out"] = band_levels(fft_power(rings["out"]))
-                emit(msg)
+                next_spec = now + SPECTRUM_EVERY
+                analyzer.update({key: band_levels(fft_power(rings[key])) for key in procs}, now, now - last_spec)
+                last_spec = now
+                emit(analyzer.message())
     finally:
         for p in procs.values():
             kill_group(p)
@@ -1298,6 +1585,7 @@ def demo_meter():
     # and nothing at all while the gate is shut between sentences.
     curve = demo_settings()["curve"]
     demo_settings_threshold = demo_settings()["gate"]["threshold"]
+    analyzer = Analyzer(("in", "out"))
     t = 0.0
     while True:
         voice = 0.5 + 0.5 * math.sin(t * 2.3) * math.sin(t * 0.7)
@@ -1310,15 +1598,15 @@ def demo_meter():
             floor = -84 + (10 if 40 < f < 70 else 0)
             v = 10 * math.log10(10 ** ((hump + 30 * (voice - 1)) / 10) + 10 ** (hiss / 10) + 10 ** (floor / 10))
             bands.append(round(clamp(v + 2 * math.sin(t * 5 + k), -120, 0), 1))
-        gate_open = lvl + 9 > demo_settings_threshold
+        gate_open = lvl > demo_settings_threshold
         out = []
         for k in range(GRID):
             f = grid_freq(k)
             hp = 40 * math.log10(f / 80) if f < 80 else 0.0
             out.append(round(clamp(bands[k] + curve[k] + hp + 2, -120, 0), 1) if gate_open else -120.0)
         emit({"type": "level", "in": round(lvl, 1), "inPeak": round(lvl + 9, 1), "out": round(lvl + 3, 1) if gate_open else -120.0})
-        if int(t * 20) % 2 == 0:
-            emit({"type": "spectrum", "bands": bands, "out": out})
+        analyzer.update({"in": bands, "out": out}, t, 0.05)
+        emit(analyzer.message())
         time.sleep(0.05)
         t += 0.05
 
@@ -1342,14 +1630,13 @@ def cmd_record():
     mic = pick_mic(settings, list_mics(sources), default_source())
     if not mic:
         fail("no microphone found")
-    chain = source_index(sources, NODE_SOURCE) is not None
     try:
         dirfd = runtime_dir()
     except (OSError, PermissionError) as e:
         fail(f"no private place to keep the recording: {e}")
+    # Only the bare microphone: After is this recording played through the
+    # chain as it is set at that moment (see cmd_play).
     targets = {"before": mic}
-    if chain:
-        targets["after"] = NODE_SOURCE
     writers, procs = {}, {}
     try:
         for which in ("before", "after"):
@@ -1403,10 +1690,30 @@ def cmd_record():
                 pass
         os.close(dirfd)
     seconds = round(writers["before"][1] / (RATE * 2), 1) if "before" in writers else 0.0
-    emit({"type": "done", "ok": True, "seconds": seconds, "after": "after" in writers})
+    emit({"type": "done", "ok": True, "seconds": seconds, "after": True})
+
+
+def wait_for_port(flag, port, seconds=4.0):
+    """Wait until pw-link lists a port ("-o" outputs, "-i" inputs)."""
+    deadline = time.monotonic() + seconds
+    want = port.encode()
+    while time.monotonic() < deadline:
+        rc, out, _ = run([PW_LINK, flag], timeout=2, cap=PWCLI_BYTES)
+        if rc == 0 and want in out.splitlines():
+            return True
+        time.sleep(0.1)
+    return False
 
 
 def cmd_play(which, sink):
+    """Play the test recording round and round until stopped.
+
+    Before: as recorded. After: through a preview of the chain, a PipeWire
+    client of its own that the panel's changes reach as well (see cmd_live),
+    so whatever you change is heard on the recording while it plays. The
+    preview is linked to the recording by hand and to nothing else: it never
+    shows up as an input or output, and no app ever hears it.
+    """
     if which not in ("before", "after"):
         fail("play takes before or after")
     if not valid_name(sink) or sink.startswith(NODE_PREFIX):
@@ -1415,45 +1722,74 @@ def cmd_play(which, sink):
     signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
     if demo_on():
         start = time.monotonic()
-        while not stop["now"] and time.monotonic() - start < 6.4:
-            emit({"type": "play", "position": round(time.monotonic() - start, 1), "length": 6.4})
+        while not stop["now"]:
+            emit({"type": "play", "position": round((time.monotonic() - start) % 6.4, 1), "length": 6.4})
             time.sleep(0.1)
         emit({"type": "done", "ok": True})
         return
     dirfd = runtime_dir()
+    player = preview = None
     try:
-        fd = open_regular(dirfd, f"{which}.wav", RECORD_BYTES + 4096)
-    finally:
-        os.close(dirfd)
-    if fd is None:
-        fail("record a test first")
-    try:
-        with wave.open(os.fdopen(fd, "rb"), "rb") as w:
-            if w.getnchannels() != 1 or w.getsampwidth() != 2 or w.getframerate() != RATE:
-                fail("the test recording is not one this plugin wrote")
-            frames = w.readframes(RECORD_BYTES // 2)
-    except (wave.Error, EOFError):
-        fail("the test recording is damaged")
-    length = len(frames) / (RATE * 2)
-    proc = spawn([PW_PLAY, "--target", sink, "--rate", str(RATE), "--channels", "1", "--format", "s16",
-                  "--raw", "--properties", "{ node.name = soundcheck_play media.role = Production }", "-"], stdin=True)
-    start = time.monotonic()
-    try:
+        fd = open_regular(dirfd, "before.wav", RECORD_BYTES + 4096)
+        if fd is None:
+            fail("record a test first")
+        try:
+            with wave.open(os.fdopen(fd, "rb"), "rb") as w:
+                if w.getnchannels() != 1 or w.getsampwidth() != 2 or w.getframerate() != RATE:
+                    fail("the test recording is not one this plugin wrote")
+                frames = w.readframes(RECORD_BYTES // 2)
+        except (wave.Error, EOFError):
+            fail("the test recording is damaged")
+        if len(frames) < RATE // 5:
+            fail("the test recording is too short")
+        length = len(frames) / (RATE * 2)
+        raw = ["--rate", str(RATE), "--channels", "1", "--channel-map", "mono", "--format", "s16", "--raw"]
+        if which == "after":
+            graph = packages()
+            if graph.get("reverb"):
+                cfd = config_dir()
+                try:
+                    ensure_reverb(cfd)
+                finally:
+                    os.close(cfd)
+            write_file(dirfd, PREVIEW_CONF, render(load_settings(), graph, "", preview_sink=sink).encode())
+            conf = os.path.join(os.environ["XDG_RUNTIME_DIR"], "omarchy-soundcheck", PREVIEW_CONF)
+            preview = spawn([PIPEWIRE, "-c", conf], quiet=True)
+            if not wait_for_port("-i", f"{NODE_PREVIEW_IN}:input_MONO"):
+                fail("the preview did not start")
+            player = spawn([PW_PLAY] + raw + ["--properties", f"{{ node.name = {NODE_PLAY} node.autoconnect = false media.role = Production }}", "-"], stdin=True)
+            if not wait_for_port("-o", f"{NODE_PLAY}:output_MONO"):
+                fail("the recording did not start playing")
+            rc, _, _ = run([PW_LINK, f"{NODE_PLAY}:output_MONO", f"{NODE_PREVIEW_IN}:input_MONO"], timeout=3)
+            if rc != 0:
+                fail("could not connect the recording to the preview")
+        else:
+            player = spawn([PW_PLAY, "--target", sink] + raw + ["--properties", f"{{ node.name = {NODE_PLAY} media.role = Production }}", "-"], stdin=True)
+        try:
+            # A small pipe, so what the panel shows is what you hear.
+            fcntl.fcntl(player.stdin.fileno(), fcntl.F_SETPIPE_SZ, 16384)
+        except (OSError, AttributeError):
+            pass
+        start = time.monotonic()
         view = memoryview(frames)
-        step = RATE * 2 // 10
-        while view and not stop["now"]:
-            proc.stdin.write(view[:step])
-            proc.stdin.flush()
-            view = view[step:]
-            emit({"type": "play", "position": round(min(length, time.monotonic() - start), 1), "length": round(length, 1)})
-        proc.stdin.close()
-        while proc.poll() is None and not stop["now"]:
-            emit({"type": "play", "position": round(min(length, time.monotonic() - start), 1), "length": round(length, 1)})
-            time.sleep(0.1)
+        step = RATE * 2 // 20
+        pos = 0
+        while not stop["now"]:
+            chunk = view[pos:pos + step]
+            player.stdin.write(chunk)
+            player.stdin.flush()
+            pos = pos + len(chunk)
+            if pos >= len(view):
+                pos = 0
+            emit({"type": "play", "position": round((time.monotonic() - start) % length, 1), "length": round(length, 1)})
     except BrokenPipeError:
         pass
     finally:
-        kill_group(proc)
+        for proc in (player, preview):
+            if proc is not None:
+                kill_group(proc)
+        remove_file(dirfd, PREVIEW_CONF)
+        os.close(dirfd)
     emit({"type": "done", "ok": True})
 
 
@@ -1474,8 +1810,8 @@ def main(argv):
             cmd_live(argv[2], cmd == "save")
         elif cmd == "mic" and len(argv) == 3:
             cmd_mic(argv[2])
-        elif cmd == "meter":
-            cmd_meter()
+        elif cmd == "meter" and len(argv) <= 3:
+            cmd_meter(argv[2] if len(argv) == 3 else "")
         elif cmd == "record":
             cmd_record()
         elif cmd == "play" and len(argv) == 4:

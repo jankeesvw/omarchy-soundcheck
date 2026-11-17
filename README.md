@@ -6,28 +6,27 @@ Soundcheck puts a chain in front of your microphone: a curve you paint with the 
 
 <p align="center"><img src="screenshots/panel.png" alt="The Soundcheck panel on a dark theme: a painted curve over the live spectrum of the microphone, the chain with high-pass, noise removal, noise gate, compressor, limiter and volume, and the test and listen-in controls" width="49%">&nbsp;<img src="screenshots/light.png" alt="The same panel on Catppuccin Latte" width="49%"></p>
 
-And it lets you hear what you did. Record ten seconds and they play straight back the way the others will hear them, with Before and After one click apart. Or listen in: your own voice in your headphones while you paint the curve, through every step.
+And it lets you hear what you did. Record ten seconds and they play back round and round the way the others will hear them, while you keep changing things, with Before and After one click apart. Or listen in: your own voice in your headphones while you paint the curve, through every step.
 
 The bar shows a pair of headphones. Dimmed while Soundcheck is off, in your accent colour while it is on, with a dot beside them while you are listening in (the one state you do not want to forget about), and crossed out in red when the chain should be running and is not.
 
 ## Install
 
-```bash
-omarchy plugin add https://github.com/jankeesvw/omarchy-soundcheck
-omarchy plugin enable jankeesvw.soundcheck
-omarchy bar move jankeesvw.soundcheck --section right
-```
-
-That is all you need for the curve, the high-pass, the noise gate, the volume, the test and listening in. They are built into PipeWire itself, so there is nothing to install for them.
-
-Two steps need a package. The panel says which one and copies the command when you click it:
+Everything in one go, the plugin together with the two packages it can use:
 
 ```bash
-omarchy pkg add noise-suppression-for-voice   # Noise removal (RNNoise)
-omarchy pkg add lsp-plugins-lv2               # Compressor and Limiter
+omarchy pkg add noise-suppression-for-voice lsp-plugins-lv2 && omarchy plugin add https://github.com/jankeesvw/omarchy-soundcheck --enable
 ```
 
-Once a package is there, its step offers to restart the chain. That is a second of silence on the microphone, so do it before a call rather than in one.
+It asks for your password for the packages, whether you trust the plugin, and where in the bar it goes (on the right unless you pick another place). Then click the headphones and switch it on.
+
+The packages are for three steps only: `noise-suppression-for-voice` for noise removal (RNNoise), `lsp-plugins-lv2` for the compressor and the limiter. The curve, the high-pass, the noise gate, distortion, reverb, the volume, the test and listening in are built into PipeWire itself. So the plugin alone works too:
+
+```bash
+omarchy plugin add https://github.com/jankeesvw/omarchy-soundcheck --enable
+```
+
+The steps that need a package then say which one, and copy the command when you click it. Once a package is there, its step offers to restart the chain. That is a second of silence on the microphone, so do it before a call rather than in one.
 
 ## Switching it on
 
@@ -47,7 +46,9 @@ Pick the microphone in the panel. The chain listens to that one microphone and n
 
 Drag across the graph and the curve follows the pointer: wherever you go, the curve goes to your height. The brush is soft, about a third of an octave wide, so a quick stroke comes out smooth rather than jagged. Drag with the right button to paint back towards 0 dB, double-click to start over flat.
 
-Behind the curve you see what your microphone is picking up right now, as a shadow, and what Soundcheck sends on, as a line over it, while the panel is open. That is the point of drawing here rather than turning knobs: the hum is a bump at 50 Hz, the boxiness is a hump around 300, the hiss is a shelf above 8 kHz, and you can paint them out where you see them.
+Behind the curve runs a live spectrum of your microphone while the panel is open: where your voice sits and how loud, twenty times a second. A dotted line over it holds the loudest each frequency has been for the last second or two, and the one that sticks out most gets its frequency written next to it. With Soundcheck on, a line shows what it sends on, so you see a peak go down as you paint over it. The scale follows your microphone, so a quiet one fills the graph as well as a loud one.
+
+That is the point of drawing here rather than turning knobs: the hum is a bump at 50 Hz, the boxiness is a hump around 300, the hiss is a shelf above 8 kHz, a whistle is a spike that keeps its label, and you can paint them out where you see them.
 
 There are two lines on top. The filled one is what you painted. The thin one is what the filters actually do, worked out with the same formulas PipeWire runs, so it is what you will hear. They match within a dB; where they part is the high-pass at the bottom end.
 
@@ -65,21 +66,25 @@ In the order your voice goes through it:
 |---|---|---|
 | **High-pass** | Rumble, pops, the desk being bumped. Everything below the frequency is cut. | 80 Hz |
 | **Noise removal** | RNNoise, a small neural network that keeps voices and drops fans, keyboards and traffic. The slider is how sure it must be that you are talking. Needs `noise-suppression-for-voice`. | 50% |
-| **Noise gate** | Silence between your sentences. Under the slider runs a strip of the last six seconds: how loud your microphone was, with the threshold drawn across it. What got through is in your accent colour, what the gate held back is grey, so you can put the threshold between the room and your voice and watch it work. | -55 dB |
+| **Noise gate** | Silence between your sentences: shut 3 dB under the threshold, fully open 3 dB over it, opening at once and letting go gently. Under the slider runs a strip of the last six seconds: how loud your microphone was, with the threshold drawn across it. What got through is in your accent colour, what the gate held back is grey, so you can put the threshold between the room and your voice and watch it work. | -55 dB |
 | **Curve** | What you painted. | flat |
+| **Distortion** | Grit, from a little warmth to a broken radio. The slider is the drive; the loudness stays about where it was. | off, 40% |
 | **Compressor** | Evens out loud and quiet. The slider is the threshold, the ratio is 3:1, and half of what it takes away at full level is given back, so switching it on makes you more even rather than quieter. Needs `lsp-plugins-lv2`. | -24 dB |
+| **Reverb** | A room around your voice: made up, about a second long, and the same room every time. The slider is how much of it you hear. | off, 30% |
 | **Limiter** | A ceiling nothing goes past, for the laugh that would otherwise clip. Needs `lsp-plugins-lv2`. | -1 dB |
 | **Volume** | The level of the whole thing, for when the curve took a lot away or added a lot. | 0 dB |
 
 ## Testing it
 
-**Record** takes up to ten seconds; press it again to stop sooner. It records your bare microphone and the processed sound at the same time, and plays the processed one straight back.
+**Record** takes up to ten seconds; press it again to stop sooner. It records your bare microphone and plays it straight back through the chain, round and round until you press Stop.
 
-**Before** and **After** switch between the two. Switching while it plays starts the other one from the top, so you compare the same sentence.
+While it plays, change anything: paint the curve, move the gate, switch a step on or off. You hear it on the next word, because After is not a recording of how it sounded then but your recording going through a preview of the chain right now. The graph and the gate's strip follow the recording while it plays, so you see what you hear. The preview is a chain of its own that plays on the output you listen in on and never reaches an app, so this works with Soundcheck switched off as well.
+
+**Before** plays the recording as it is. Switching while it plays starts the other one from the top, so you compare the same sentence.
 
 While a test plays, listening in pauses, or you would hear yourself twice.
 
-The recordings live in `$XDG_RUNTIME_DIR/omarchy-soundcheck/`, which is memory, not disk. The next test replaces them and logging out removes them.
+The recording lives in `$XDG_RUNTIME_DIR/omarchy-soundcheck/`, which is memory, not disk. The next test replaces it and logging out removes it.
 
 ## Listening in
 
@@ -118,8 +123,9 @@ soundcheck demo on | off               # invented devices and curve, for screens
 - `~/.config/omarchy-soundcheck/settings.json`: your curve and the settings of every step.
 - `~/.config/omarchy-soundcheck/state.json`: the microphone to give back when you switch off, and which packages the running chain was built with.
 - `~/.config/omarchy-soundcheck/pipewire.conf`: the chain, only while Soundcheck is on.
+- `~/.config/omarchy-soundcheck/reverb.wav`: the room the reverb plays, written the first time it is needed.
 - `~/.config/systemd/user/omarchy-soundcheck.service`: the service that runs it, only while Soundcheck is on.
-- `$XDG_RUNTIME_DIR/omarchy-soundcheck/`: the last test recording, in memory.
+- `$XDG_RUNTIME_DIR/omarchy-soundcheck/`: the last test recording, and the preview's config while one plays, in memory.
 
 The directory is private to you (0700, files 0600) and every file is written to a temporary name first and then moved into place, so a half-written settings file cannot happen.
 
