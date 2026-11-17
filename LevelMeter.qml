@@ -34,7 +34,11 @@ Item {
   readonly property real barW: Style.space(8)
   readonly property real gap: Style.space(10)
   readonly property real labelW: scaleProbe.implicitWidth + Style.space(4)
-  implicitWidth: labelW + barW * 2 + gap
+  readonly property real bars: barW * 2 + gap
+  // OUT and the CLIP badge are wider than what they sit under. They get room
+  // on the right, or the edge of the panel cuts them off.
+  readonly property real overhang: Math.max(0, outProbe.implicitWidth / 2 - barW / 2, (clipBadge.width - bars) / 2)
+  implicitWidth: labelW + bars + overhang
   readonly property bool clipping: (sides.in.clip > now) || (hasOutput && sides.out.clip > now)
   property real now: 0
 
@@ -92,6 +96,15 @@ Item {
     text: "-48"
     font.family: meter.fontFamily
     font.pixelSize: Math.round(Style.font.caption * 0.85)
+  }
+
+  Text {
+    id: outProbe
+    visible: false
+    text: "OUT"
+    font.family: meter.fontFamily
+    font.pixelSize: Math.round(Style.font.caption * 0.8)
+    font.bold: true
   }
 
   // The scale, on the left.
@@ -185,7 +198,8 @@ Item {
 
   // CLIP under both bars: dim until something clips, so you know where to look.
   Rectangle {
-    x: meter.labelW + (meter.barW * 2 + meter.gap) / 2 - width / 2
+    id: clipBadge
+    x: meter.labelW + meter.bars / 2 - width / 2
     anchors.bottom: parent.bottom
     anchors.bottomMargin: Style.space(4)
     width: clipText.implicitWidth + Style.space(8)
